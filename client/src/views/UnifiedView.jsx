@@ -553,8 +553,11 @@ export default function UnifiedView() {
     socket.on('autodj:update', ({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); });
     fetch('/api/autodj/status').then(r => r.json()).then(({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); }).catch(() => {});
     socket.on('users:online', (data) => setOnlineUsers(data));
-    socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
-    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); };
+    // Emit user:join now and re-emit on every reconnect
+    const emitJoin = () => socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
+    emitJoin();
+    socket.on('connect', emitJoin);
+    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); socket.off('connect', emitJoin); };
   }, [authToken, currentUser]);
 
   useEffect(() => {
