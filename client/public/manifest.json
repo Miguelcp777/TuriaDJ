@@ -1,0 +1,14 @@
+{
+  "name": "TuriaDJ",
+  "short_name": "TuriaDJ",
+  "description": "Jukebox democratico · Falla Turia",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d0608",
+  "theme_color": "#0a0a14",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/logo_falla.jpg", "sizes": "192x192", "type": "image/jpeg" },
+    { "src": "/logo_falla.jpg", "sizes": "512x512", "type": "image/jpeg" }
+  ]
+}

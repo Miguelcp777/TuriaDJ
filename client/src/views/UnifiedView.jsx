@@ -53,7 +53,7 @@ function AuthModal({ onAuth }) {
   const handleKey = (e) => { if (e.key === 'Enter') submit(); };
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4"
+    <div className="min-h-[100dvh] flex items-center justify-center px-4"
       style={{ background: 'linear-gradient(160deg, #1a0505 0%, #0d0608 100%)' }}>
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
@@ -763,9 +763,28 @@ export default function UnifiedView() {
     activeRef.current = 'A'; setIsPlaying(false);
   };
 
+
+  // ── Media Session API: lock-screen controls + background playback ──────────
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return;
+    if (!nowPlaying) { navigator.mediaSession.metadata = null; return; }
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title:  nowPlaying.title  || 'Desconocido',
+      artist: nowPlaying.artist || '',
+      album:  nowPlaying.album  || '',
+      artwork: nowPlaying.cover_art_id
+        ? [{ src: '/api/cover/' + nowPlaying.cover_art_id, sizes: '512x512', type: 'image/jpeg' }]
+        : []
+    });
+    const audio = audioA.current;
+    navigator.mediaSession.setActionHandler('play',  () => { if (audio) audio.play().then(() => setIsPlaying(true)).catch(() => {}); });
+    navigator.mediaSession.setActionHandler('pause', () => { if (audio) { audio.pause(); if (!voterListening) setIsPlaying(false); } });
+    navigator.mediaSession.setActionHandler('stop',  () => { if (audio) { audio.pause(); audio.src = ''; } setIsPlaying(false); setVoterListening(false); });
+    navigator.mediaSession.setActionHandler('nexttrack', isAdmin ? handleSkip : null);
+  }, [nowPlaying, isAdmin]);
   // ── render ─────────────────────────────────────────────────────────────────
   if (authLoading || (currentUser && sessionActive === null)) return (
-    <div className="min-h-screen flex items-center justify-center" style={{ background: '#0d0608' }}>
+    <div className="min-h-[100dvh] flex items-center justify-center" style={{ background: '#0d0608' }}>
       <div className="w-8 h-8 border-2 border-red-700 border-t-transparent rounded-full animate-spin" />
     </div>
   );
@@ -773,7 +792,7 @@ export default function UnifiedView() {
 
   // Non-admin waiting screen when session is closed
   if (!isAdmin && !sessionActive) return (
-    <div className="min-h-screen flex flex-col items-center justify-center fade-in px-6"
+    <div className="min-h-[100dvh] flex flex-col items-center justify-center fade-in px-6"
       style={{ background: 'linear-gradient(160deg, #1a0505 0%, #0d0608 100%)' }}>
       <img src={LOGO} className="w-28 h-28 object-contain rounded-full bg-white/5 p-3 mb-8" alt="" />
       <h1 className="text-3xl font-extrabold text-white mb-1 tracking-tight">
@@ -797,7 +816,7 @@ export default function UnifiedView() {
   );
 
   return (
-    <div className="min-h-screen text-white flex flex-col max-w-2xl mx-auto px-4 pb-10"
+    <div className="min-h-[100dvh] text-white flex flex-col max-w-2xl mx-auto px-4 pb-10"
       style={{ background: 'linear-gradient(160deg, #1a0505 0%, #0d0608 40%, #0d0608 100%)' }}>
 
       {adminPanelOpen && (
@@ -1095,14 +1114,14 @@ export default function UnifiedView() {
       </div>
 
       {/* Two audio elements for crossfade */}
-      <audio ref={audioA}
+      <audio ref={audioA} playsInline
         onEnded={() => handleEnded('A')}
         onTimeUpdate={() => handleTimeUpdate('A')}
         onPlay={() => { if (activeRef.current === 'A') setIsPlaying(true); }}
         onPause={() => { if (activeRef.current === 'A' && !fadeScheduled.current) setIsPlaying(false); }}
         onLoadedMetadata={() => { if (activeRef.current === 'A') setDuration(audioA.current?.duration || 0); }}
       />
-      <audio ref={audioB}
+      <audio ref={audioB} playsInline
         onEnded={() => handleEnded('B')}
         onTimeUpdate={() => handleTimeUpdate('B')}
         onPlay={() => {}}
