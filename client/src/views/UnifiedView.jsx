@@ -54,7 +54,7 @@ function AuthModal({ onAuth }) {
 
   return (
     <div className="min-h-[100dvh] flex items-center justify-center px-4"
-      style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
+      style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat" }}>
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
           <img src="/dj_falla.png" className="w-48 h-36 object-cover rounded-2xl mb-5 shadow-2xl shadow-red-900/50" alt="DJ Falla Edition" />
@@ -458,6 +458,8 @@ export default function UnifiedView() {
   const voterSBRef    = useRef(null);
   const voterRdrRef   = useRef(null);
   const voterUrlRef   = useRef(null);
+  const voterACtxRef  = useRef(null); // AudioContext keepalive (iOS)
+  const voterKaRef    = useRef(null); // keepalive interval id
   const activeRef     = useRef('A');          // which element is the current player
   const fadeScheduled = useRef(false);        // crossfade has been triggered
   const crossfadeRaf  = useRef(null);         // requestAnimationFrame handle
@@ -502,6 +504,8 @@ export default function UnifiedView() {
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false);
   const [voterListening, setVoterListening] = useState(false);
   const [voterLoading,   setVoterLoading]   = useState(false);
+  const [installPrompt,  setInstallPrompt]  = useState(null);
+  const [showInstallBanner, setShowInstallBanner] = useState(false);
 
   // ── init after auth ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -610,6 +614,24 @@ export default function UnifiedView() {
       }
       audioA.current.addEventListener('canplay', () => setVoterLoading(false), { once: true });
       setTimeout(() => setVoterLoading(false), 10000);
+      // AudioContext keepalive: play a silent buffer every 25s so iOS
+      // does not suspend the audio session when the screen locks
+      try {
+        const AC = window.AudioContext || window.webkitAudioContext;
+        if (AC) {
+          if (voterACtxRef.current) { try { voterACtxRef.current.close(); } catch(e) {} }
+          const ctx = new AC();
+          voterACtxRef.current = ctx;
+          const ping = () => {
+            if (!voterACtxRef.current) return;
+            const buf = ctx.createBuffer(1, 1, 22050);
+            const src = ctx.createBufferSource();
+            src.buffer = buf; src.connect(ctx.destination); src.start(0);
+          };
+          ping();
+          voterKaRef.current = setInterval(ping, 25000);
+        }
+      } catch(e) {}
       audioA.current.play().catch(() => {});
       setVoterListening(true);
     } catch(e) {
@@ -620,6 +642,8 @@ export default function UnifiedView() {
   };
 
   const stopListening = () => {
+    if (voterKaRef.current) { clearInterval(voterKaRef.current); voterKaRef.current = null; }
+    if (voterACtxRef.current) { try { voterACtxRef.current.close(); } catch(e) {} voterACtxRef.current = null; }
     if (voterRdrRef.current) { voterRdrRef.current.cancel(); voterRdrRef.current = null; }
     if (voterMSRef.current && voterMSRef.current.readyState === 'open') {
       try { voterMSRef.current.endOfStream(); } catch(e) {}
@@ -828,9 +852,60 @@ export default function UnifiedView() {
     navigator.mediaSession.setActionHandler('stop',  () => { if (audio) { audio.pause(); audio.src = ''; } setIsPlaying(false); setVoterListening(false); });
     navigator.mediaSession.setActionHandler('nexttrack', isAdmin ? handleSkip : null);
   }, [nowPlaying, isAdmin]);
+
+  // ── Media Session for voter (updates play/pause to control live stream) ──
+  useEffect(() => {
+    if (isAdmin || !('mediaSession' in navigator)) return;
+    if (nowPlaying) {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title:  nowPlaying.title  || 'En directo',
+        artist: nowPlaying.artist || 'TuriaDJ',
+        album:  nowPlaying.album  || '',
+        artwork: nowPlaying.cover_art_id
+          ? [{ src: '/api/cover/' + nowPlaying.cover_art_id, sizes: '512x512', type: 'image/jpeg' }]
+          : [{ src: '/dj_falla.png', sizes: '512x512', type: 'image/png' }]
+      });
+    }
+    navigator.mediaSession.setActionHandler('play',  voterListening ? null : () => startListening());
+    navigator.mediaSession.setActionHandler('pause', voterListening ? () => stopListening() : null);
+    navigator.mediaSession.setActionHandler('stop',  () => stopListening());
+    navigator.mediaSession.playbackState = voterListening ? 'playing' : 'paused';
+  }, [voterListening, nowPlaying, isAdmin]);
+
+  // ── PWA install prompt (Android: beforeinstallprompt / iOS: detect Safari) ─
+  useEffect(() => {
+    const dismissed = localStorage.getItem('pwa_banner_dismissed');
+    if (dismissed) return;
+    const isStandalone = window.navigator.standalone ||
+      window.matchMedia('(display-mode: standalone)').matches;
+    if (isStandalone) return;
+    // Android/Chrome
+    const handler = (e) => {
+      e.preventDefault();
+      setInstallPrompt(e);
+      setShowInstallBanner(true);
+    };
+    window.addEventListener('beforeinstallprompt', handler);
+    // iOS Safari
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const isSafari = /safari/i.test(navigator.userAgent) && !/chrome/i.test(navigator.userAgent);
+    if (isIOS && isSafari) setShowInstallBanner(true);
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+
+  const dismissInstallBanner = () => {
+    setShowInstallBanner(false);
+    localStorage.setItem('pwa_banner_dismissed', '1');
+  };
+  const triggerInstall = async () => {
+    if (!installPrompt) return;
+    installPrompt.prompt();
+    const { outcome } = await installPrompt.userChoice;
+    if (outcome === 'accepted') dismissInstallBanner();
+  };
   // ── render ─────────────────────────────────────────────────────────────────
   if (authLoading || (currentUser && sessionActive === null)) return (
-    <div className="min-h-[100dvh] flex items-center justify-center" style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
+    <div className="min-h-[100dvh] flex items-center justify-center" style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat" }}>
       <div className="w-8 h-8 border-2 border-red-700 border-t-transparent rounded-full animate-spin" />
     </div>
   );
@@ -839,7 +914,7 @@ export default function UnifiedView() {
   // Non-admin waiting screen when session is closed
   if (!isAdmin && !sessionActive) return (
     <div className="min-h-[100dvh] flex flex-col items-center justify-center fade-in px-6"
-      style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
+      style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat" }}>
       <img src="/dj_falla.png" className="w-56 h-40 object-cover rounded-2xl mb-8 shadow-2xl shadow-red-900/50" alt="DJ Falla Edition" />
       <h1 className="text-3xl font-extrabold text-white mb-1 tracking-tight">
         {sessionName || 'TuriaDJ'}
@@ -863,7 +938,39 @@ export default function UnifiedView() {
 
   return (
     <div className="min-h-[100dvh] text-white flex flex-col max-w-2xl mx-auto px-4 pb-10"
-      style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
+      style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat" }}>
+
+      {/* PWA install banner */}
+      {showInstallBanner && (
+        <div className="fixed bottom-0 left-0 right-0 z-50 px-4 pb-4 pt-0 pointer-events-none">
+          <div className="max-w-2xl mx-auto bg-gray-900/95 border border-gray-700/60 rounded-2xl p-4 flex items-start gap-3 shadow-2xl pointer-events-auto">
+            <img src="/dj_falla.png" className="w-12 h-12 rounded-xl object-cover flex-shrink-0" alt="" />
+            <div className="flex-1 min-w-0">
+              <p className="text-sm font-bold text-white">Instala TuriaDJ</p>
+              {installPrompt ? (
+                <>
+                  <p className="text-xs text-gray-400 mt-0.5">Instala la app para escuchar en segundo plano con la pantalla bloqueada.</p>
+                  <button onClick={triggerInstall}
+                    className="mt-2 px-4 py-1.5 rounded-xl text-xs font-semibold text-white"
+                    style={{ background: 'linear-gradient(135deg,#dc2626,#b91c1c)' }}>
+                    Instalar app
+                  </button>
+                </>
+              ) : (
+                <p className="text-xs text-gray-400 mt-0.5 leading-relaxed">
+                  Para escuchar con la pantalla bloqueada: toca
+                  <span className="text-white font-semibold"> Compartir </span>
+                  y luego
+                  <span className="text-white font-semibold"> "Agregar a pantalla de inicio"</span>.
+                </p>
+              )}
+            </div>
+            <button onClick={dismissInstallBanner} className="text-gray-500 hover:text-gray-300 flex-shrink-0 mt-0.5">
+              <X size={18} />
+            </button>
+          </div>
+        </div>
+      )}
 
       {adminPanelOpen && (
         <AdminPanel currentUser={currentUser} authToken={authToken} onClose={() => setAdminPanelOpen(false)} />
