@@ -948,7 +948,7 @@ export default function UnifiedView() {
         </button>
         {libraryOpen && (
           <div className="fade-in">
-            <div className="flex gap-2 overflow-x-auto pb-2 mb-3 no-scrollbar">
+            <div className="flex flex-wrap gap-2 pb-2 mb-3">
               <button onClick={() => loadBrowse(null)}
                 className={'px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all flex-shrink-0 ' +
                   (selectedPlaylist === null ? 'bg-red-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white')}>
