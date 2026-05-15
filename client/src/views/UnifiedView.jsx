@@ -275,7 +275,7 @@ function SessionPanel({ sessionActive, sessionName: initName, sessionDesc: initD
   const [ending, setEnding]       = useState(false);
   const [endConfirm, setEndConfirm] = useState(false);
 
-  const shareUrl = window.location.origin;
+  const shareUrl = "https://turiadj.i-automate.es";
 
   const saveInfo = async () => {
     setSaving(true);
