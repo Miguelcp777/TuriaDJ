@@ -501,6 +501,7 @@ export default function UnifiedView() {
   const [sessionDesc, setSessionDesc]         = useState('');
   const [sessionPanelOpen, setSessionPanelOpen] = useState(false);
   const [voterListening, setVoterListening] = useState(false);
+  const [voterLoading,   setVoterLoading]   = useState(false);
 
   // ── init after auth ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -572,6 +573,7 @@ export default function UnifiedView() {
     try {
       stopListening();
       if (!audioA.current) return;
+      setVoterLoading(true);
       const liveUrl = '/api/live?t=' + Date.now();
       let useMSE = false;
       try { useMSE = 'MediaSource' in window && MediaSource.isTypeSupported('audio/mpeg'); } catch(e) {}
@@ -606,11 +608,14 @@ export default function UnifiedView() {
         audioA.current.src = liveUrl;
         audioA.current.volume = 1;
       }
+      audioA.current.addEventListener('canplay', () => setVoterLoading(false), { once: true });
+      setTimeout(() => setVoterLoading(false), 10000);
       audioA.current.play().catch(() => {});
       setVoterListening(true);
     } catch(e) {
       console.warn('startListening error:', e);
       setVoterListening(false);
+      setVoterLoading(false);
     }
   };
 
@@ -623,6 +628,7 @@ export default function UnifiedView() {
     if (voterUrlRef.current) { URL.revokeObjectURL(voterUrlRef.current); voterUrlRef.current = null; }
     if (audioA.current) { audioA.current.pause(); audioA.current.src = ''; }
     setVoterListening(false);
+    setVoterLoading(false);
   };
 
   // crossfade: immediately start incoming audio at vol 0, ramp both over 4 s
@@ -952,22 +958,35 @@ export default function UnifiedView() {
               </div>
             </div>
             {!isAdmin && (
-              <div className="flex items-center gap-3 mt-1">
-                <button onClick={voterListening ? stopListening : startListening}
-                  className={'flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all active:scale-95 ' +
-                    (voterListening
-                      ? 'bg-gray-700 text-gray-300 hover:bg-gray-600'
-                      : 'text-white hover:opacity-90')}
-                  style={voterListening ? {} : { background: 'linear-gradient(135deg, #dc2626, #b91c1c)' }}>
-                  {voterListening
-                    ? <><VolumeX size={15} /><span>Silenciar</span></>
-                    : <><Volume2 size={15} /><span>Escuchar</span></>}
-                </button>
-                {voterListening && (
-                  <span className="text-xs text-green-400 flex items-center gap-1">
-                    <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse inline-block" />
-                    En directo
-                  </span>
+              <div className="mt-1">
+                {voterLoading ? (
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <div className="w-3 h-3 border-2 border-red-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+                      <span className="text-xs text-gray-400 font-medium">Cargando buffer...</span>
+                    </div>
+                    <div className="h-1.5 bg-gray-800/70 rounded-full overflow-hidden">
+                      <div className="h-full rounded-full"
+                        style={{ background: 'linear-gradient(90deg,#dc2626,#f59e0b)', animation: 'buf-fill 3s ease-out forwards' }} />
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-3">
+                    <button onClick={voterListening ? stopListening : startListening}
+                      className={'flex items-center gap-2 px-4 py-2 rounded-xl text-sm font-semibold transition-all active:scale-95 ' +
+                        (voterListening ? 'bg-gray-700 text-gray-300 hover:bg-gray-600' : 'text-white hover:opacity-90')}
+                      style={voterListening ? {} : { background: 'linear-gradient(135deg, #dc2626, #b91c1c)' }}>
+                      {voterListening
+                        ? <><VolumeX size={15} /><span>Silenciar</span></>
+                        : <><Volume2 size={15} /><span>Escuchar</span></>}
+                    </button>
+                    {voterListening && (
+                      <span className="text-xs text-green-400 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse inline-block" />
+                        En directo
+                      </span>
+                    )}
+                  </div>
                 )}
               </div>
             )}
