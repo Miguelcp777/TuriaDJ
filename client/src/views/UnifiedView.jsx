@@ -506,6 +506,10 @@ export default function UnifiedView() {
   const [voterLoading,   setVoterLoading]   = useState(false);
   const [installPrompt,  setInstallPrompt]  = useState(null);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
+  const [autoDJEnabled, setAutoDJEnabled] = useState(false);
+  const [autoDJActive,  setAutoDJActive]  = useState(false);
+  const [onlineUsers,   setOnlineUsers]   = useState({ count: 0, users: [] });
+  const [showOnlinePanel, setShowOnlinePanel] = useState(false);
 
   // ── init after auth ────────────────────────────────────────────────────────
   useEffect(() => {
@@ -546,7 +550,11 @@ export default function UnifiedView() {
     authFetch('/api/playlists').then(r => r.json()).then(setPlaylists).catch(() => {});
     authFetch('/api/queue/my-votes').then(r => r.json())
       .then(ids => setVotedSongs(new Set(ids))).catch(() => {});
-    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); };
+    socket.on('autodj:update', ({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); });
+    fetch('/api/autodj/status').then(r => r.json()).then(({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); }).catch(() => {});
+    socket.on('users:online', (data) => setOnlineUsers(data));
+    socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
+    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); };
   }, [authToken, currentUser]);
 
   useEffect(() => {
@@ -757,6 +765,17 @@ export default function UnifiedView() {
     if (song) loadAndPlay(song);
   };
 
+  const toggleAutoDJ = async () => {
+    const r = await authFetch('/api/autodj/toggle', { method: 'POST' });
+    const { enabled } = await r.json();
+    setAutoDJEnabled(enabled);
+    if (enabled && !nowPlaying) {
+      const r2 = await authFetch('/api/player/next', { method: 'POST' });
+      const { song } = await r2.json();
+      if (song) loadAndPlay(song);
+    }
+  };
+
   const seekTo = (e) => {
     const audio = getActive();
     if (!audio || !duration) return;
@@ -940,6 +959,38 @@ export default function UnifiedView() {
     <div className="min-h-[100dvh] text-white flex flex-col max-w-2xl mx-auto px-4 pb-10"
       style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat" }}>
 
+      {/* Online users panel */}
+      {showOnlinePanel && isAdmin && (
+        <div className="fixed inset-0 z-50 flex items-start justify-center pt-20 px-4" onClick={() => setShowOnlinePanel(false)}>
+          <div className="bg-gray-900 border border-gray-700/60 rounded-2xl p-4 w-full max-w-xs shadow-2xl" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-3">
+              <p className="text-sm font-bold text-white flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-green-500 inline-block animate-pulse" />
+                {onlineUsers.count} usuario{onlineUsers.count !== 1 ? 's' : ''} online
+              </p>
+              <button onClick={() => setShowOnlinePanel(false)} className="text-gray-500 hover:text-gray-300"><X size={16} /></button>
+            </div>
+            {onlineUsers.users.length === 0 ? (
+              <p className="text-xs text-gray-600 text-center py-2">Nadie conectado</p>
+            ) : (
+              <ul className="space-y-1.5 max-h-60 overflow-y-auto">
+                {onlineUsers.users.map((u, i) => (
+                  <li key={i} className="flex items-center gap-2.5 py-1.5 px-2 rounded-xl bg-gray-800/50">
+                    <div className="w-7 h-7 rounded-full bg-gray-700 flex items-center justify-center flex-shrink-0">
+                      <UserCircle2 size={14} className="text-gray-400" />
+                    </div>
+                    <span className="text-sm text-gray-200 flex-1 truncate">{u.username}</span>
+                    {u.role === 'admin' && (
+                      <span className="text-[9px] bg-yellow-900/50 text-yellow-500 px-1.5 py-0.5 rounded font-semibold">ADMIN</span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* PWA install banner */}
       {showInstallBanner && (
         <div className="fixed bottom-0 left-0 right-0 z-50 px-4 pb-4 pt-0 pointer-events-none">
@@ -1017,6 +1068,13 @@ export default function UnifiedView() {
             <span className="text-xs text-gray-500">{currentUser.username}</span>
             {isAdmin && <span className="text-[10px] bg-yellow-900/50 text-yellow-500 px-1.5 py-0.5 rounded font-semibold">ADMIN</span>}
           </div>
+          {isAdmin && (
+            <button onClick={() => setShowOnlinePanel(p => !p)}
+              className="flex items-center gap-1 text-gray-500 hover:text-gray-300 transition-colors" title="Usuarios online">
+              <span className="w-1.5 h-1.5 rounded-full bg-green-500 inline-block" />
+              <span className="text-xs font-semibold">{onlineUsers.count}</span>
+            </button>
+          )}
           {isAdmin && (
             <button onClick={() => setAdminPanelOpen(true)}
               className="text-gray-600 hover:text-yellow-500 transition-colors" title="Panel de control">
@@ -1113,11 +1171,21 @@ export default function UnifiedView() {
                   className="w-10 h-10 bg-gray-800/80 hover:bg-gray-700 rounded-xl flex items-center justify-center transition-all active:scale-95 text-gray-400 hover:text-white">
                   <SkipForward size={18} />
                 </button>
-                {queue.length > 0 && (
+                <button onClick={toggleAutoDJ} title="AutoDJ"
+                  className={"w-10 h-10 rounded-xl flex items-center justify-center transition-all active:scale-95 text-xs font-bold " +
+                    (autoDJEnabled ? "bg-red-700/90 text-white" : "bg-gray-800/80 text-gray-500 hover:text-gray-300 hover:bg-gray-700")}>
+                  DJ
+                </button>
+                {autoDJActive ? (
+                  <p className="ml-auto text-xs text-red-400/80 flex items-center gap-1">
+                    <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse inline-block" />
+                    AutoDJ
+                  </p>
+                ) : queue.length > 0 ? (
                   <p className="ml-auto text-xs text-gray-600 truncate max-w-[140px]">
                     Siguiente: <span className="text-gray-400">{queue[0].title}</span>
                   </p>
-                )}
+                ) : null}
               </div>
             )}
           </>
@@ -1129,11 +1197,21 @@ export default function UnifiedView() {
             <div>
               <p className="font-semibold text-gray-400">Sin reproducir</p>
               <p className="text-sm text-gray-600 mt-1">Busca una cancion y añadela a la cola</p>
-              {isAdmin && queue.length > 0 && (
-                <button onClick={handleStart}
-                  className="mt-2 flex items-center gap-1.5 text-xs text-red-400 hover:text-red-300 transition-colors">
-                  <Play size={12} /> Empezar
-                </button>
+              {isAdmin && (
+                <div className="flex items-center gap-3 mt-2">
+                  {queue.length > 0 && (
+                    <button onClick={handleStart}
+                      className="flex items-center gap-1.5 text-xs text-red-400 hover:text-red-300 transition-colors">
+                      <Play size={12} /> Empezar
+                    </button>
+                  )}
+                  <button onClick={toggleAutoDJ}
+                    className={"flex items-center gap-1.5 text-xs font-semibold transition-colors " +
+                      (autoDJEnabled ? "text-red-400 hover:text-red-300" : "text-gray-500 hover:text-gray-300")}>
+                    <span className={"w-1.5 h-1.5 rounded-full inline-block mr-1 " + (autoDJEnabled ? "bg-red-500 animate-pulse" : "bg-gray-600")} />
+                    AutoDJ {autoDJEnabled ? "ON" : "OFF"}
+                  </button>
+                </div>
               )}
             </div>
           </div>

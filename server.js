@@ -333,11 +333,33 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/dist/index.
 let lastProgress  = { position: 0 };
 let autoDJActive  = false;
 
+// Online users: socketId -> { username, role }
+const onlineUsers = new Map();
+
+function broadcastOnline() {
+  const list = [...onlineUsers.values()];
+  io.emit('users:online', { count: list.length, users: list });
+}
+
 io.on('connection', socket => {
   socket.emit('queue:update',   db.getQueue());
   socket.emit('player:update',  db.getNowPlaying());
   socket.emit('session:update', { active: db.getSessionActive(), name: db.getSessionName(), desc: db.getSessionDesc() });
   socket.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: autoDJActive });
+  // Send current online list to this socket
+  const list = [...onlineUsers.values()];
+  socket.emit('users:online', { count: list.length, users: list });
+
+  socket.on('user:join', ({ username, role }) => {
+    onlineUsers.set(socket.id, { username, role });
+    broadcastOnline();
+  });
+
+  socket.on('disconnect', () => {
+    onlineUsers.delete(socket.id);
+    broadcastOnline();
+  });
+
   socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
 });
 
