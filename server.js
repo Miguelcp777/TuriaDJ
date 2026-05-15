@@ -38,7 +38,10 @@ function bcastTick() {
 }
 
 function startBroadcast(songId) {
-  stopBroadcast();
+  // Stop upstream + clear queue but keep voter connections alive (seamless switch)
+  if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
+  if (bcastUpstream) { try { bcastUpstream.destroy(); } catch(e) {} bcastUpstream = null; }
+  bcastQueue = Buffer.alloc(0);
   const url = nd.streamUrl(songId);
   axios.get(url, { responseType: 'stream', timeout: 0 })
     .then(upstream => {
@@ -228,12 +231,15 @@ app.post('/api/player/next', auth.adminMiddleware, (req, res) => {
 });
 
 app.get('/api/live', (req, res) => {
+  req.socket.setTimeout(0);        // no idle timeout for live stream
+  req.socket.setNoDelay(true);     // flush each chunk immediately
   res.setHeader('Content-Type', 'audio/mpeg');
   res.setHeader('Cache-Control', 'no-cache, no-store');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
   bcastClients.add(res);
   req.on('close', () => { bcastClients.delete(res); });
+  req.socket.on('error', () => { bcastClients.delete(res); });
 });
 
 app.get('/api/stream/:id', async (req, res) => {

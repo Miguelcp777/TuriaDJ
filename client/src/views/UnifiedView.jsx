@@ -453,6 +453,11 @@ export default function UnifiedView() {
   // ── dual audio + crossfade ─────────────────────────────────────────────────
   const audioA        = useRef(null);
   const audioB        = useRef(null);
+  // voter MSE streaming
+  const voterMSRef    = useRef(null);
+  const voterSBRef    = useRef(null);
+  const voterRdrRef   = useRef(null);
+  const voterUrlRef   = useRef(null);
   const activeRef     = useRef('A');          // which element is the current player
   const fadeScheduled = useRef(false);        // crossfade has been triggered
   const crossfadeRaf  = useRef(null);         // requestAnimationFrame handle
@@ -558,26 +563,64 @@ export default function UnifiedView() {
   };
 
   // voter: switch to new song if listening (called from player:update)
-  const setVoterListeningSong = (song) => {
-    if (!audioA.current || !song || !voterListening) return;
-    // Reconnect to broadcast — server has already switched the stream
-    audioA.current.src = '/api/live?t=' + Date.now();
-    audioA.current.load();
-    audioA.current.play().catch(() => {});
+  const setVoterListeningSong = (_song) => {
+    // Server keeps voter connection alive during song switch — no action needed.
+    // New song data flows automatically into the existing stream.
   };
 
   const startListening = async () => {
     try {
+      stopListening();
       if (!audioA.current) return;
-      audioA.current.src = '/api/live';
-      audioA.current.volume = 1;
-      audioA.current.load();
+      const liveUrl = '/api/live?t=' + Date.now();
+      let useMSE = false;
+      try { useMSE = 'MediaSource' in window && MediaSource.isTypeSupported('audio/mpeg'); } catch(e) {}
+      if (useMSE) {
+        const ms = new MediaSource();
+        voterMSRef.current = ms;
+        const objUrl = URL.createObjectURL(ms);
+        voterUrlRef.current = objUrl;
+        audioA.current.src = objUrl;
+        await new Promise((res, rej) => {
+          ms.addEventListener('sourceopen', res, { once: true });
+          setTimeout(() => rej(new Error('MSE timeout')), 5000);
+        });
+        const sb = ms.addSourceBuffer('audio/mpeg');
+        voterSBRef.current = sb;
+        const resp = await fetch(liveUrl);
+        if (!resp.ok) throw new Error('stream error');
+        const reader = resp.body.getReader();
+        voterRdrRef.current = reader;
+        (async () => {
+          try {
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done || !voterRdrRef.current) break;
+              if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
+              if (ms.readyState === 'open') sb.appendBuffer(value);
+            }
+          } catch(e) { /* stream ended or stopped */ }
+        })();
+      } else {
+        // Fallback: direct audio src (Chrome/Firefox without MSE)
+        audioA.current.src = liveUrl;
+        audioA.current.volume = 1;
+      }
       await audioA.current.play();
       setVoterListening(true);
-    } catch (e) { console.warn('listen failed', e); }
+    } catch(e) {
+      console.warn('startListening error:', e);
+      setVoterListening(false);
+    }
   };
 
   const stopListening = () => {
+    if (voterRdrRef.current) { voterRdrRef.current.cancel(); voterRdrRef.current = null; }
+    if (voterMSRef.current && voterMSRef.current.readyState === 'open') {
+      try { voterMSRef.current.endOfStream(); } catch(e) {}
+    }
+    voterMSRef.current = null; voterSBRef.current = null;
+    if (voterUrlRef.current) { URL.revokeObjectURL(voterUrlRef.current); voterUrlRef.current = null; }
     if (audioA.current) { audioA.current.pause(); audioA.current.src = ''; }
     setVoterListening(false);
   };
