@@ -17,34 +17,51 @@ app.use(express.json());
 // ── Live broadcast engine ────────────────────────────────────────────────────
 // Streams one Navidrome song to all voter clients at real-time bitrate.
 // Rate-limiter sends BYTES_PER_TICK every TICK_MS — default 192 kbps.
-const TICK_MS        = 100;
-const BROADCAST_BPS  = 192 * 1024 / 8; // 192 kbps = 24000 B/s
-const BYTES_PER_TICK = Math.ceil(BROADCAST_BPS * TICK_MS / 1000); // ~2400 B
+const TICK_MS       = 50;   // 50 ms ticks for smooth delivery
+const JOIN_BUF_SECS = 2;    // seconds of audio kept for late joiners
 
-let bcastClients  = new Set();
-let bcastQueue    = Buffer.alloc(0);
-let bcastTicker   = null;
-let bcastUpstream = null;
+let bcastClients    = new Set();
+let bcastQueue      = Buffer.alloc(0);
+let bcastJoinBuf    = Buffer.alloc(0);
+let bcastJoinBufMax = 0;
+let bcastBPS        = 16000; // bytes/sec, recalculated per song
+let bcastTicker     = null;
+let bcastUpstream   = null;
 
 function bcastTick() {
   if (bcastQueue.length === 0) return;
-  const chunk = bcastQueue.slice(0, BYTES_PER_TICK);
-  bcastQueue  = bcastQueue.slice(BYTES_PER_TICK);
-  const dead  = [];
+  const bytesPerTick = Math.ceil(bcastBPS * TICK_MS / 1000);
+  const chunk = bcastQueue.slice(0, bytesPerTick);
+  bcastQueue  = bcastQueue.slice(bytesPerTick);
+  // Rolling join buffer: keep last JOIN_BUF_SECS of audio for late joiners
+  bcastJoinBuf = Buffer.concat([bcastJoinBuf, chunk]);
+  if (bcastJoinBuf.length > bcastJoinBufMax && bcastJoinBufMax > 0)
+    bcastJoinBuf = bcastJoinBuf.slice(bcastJoinBuf.length - bcastJoinBufMax);
+  const dead = [];
   bcastClients.forEach(res => {
     try { res.write(chunk); } catch (e) { dead.push(res); }
   });
   dead.forEach(r => bcastClients.delete(r));
 }
 
-function startBroadcast(songId) {
-  // Stop upstream + clear queue but keep voter connections alive (seamless switch)
+function startBroadcast(songId, duration) {
+  // Keep existing voter connections alive, just swap source
   if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
   if (bcastUpstream) { try { bcastUpstream.destroy(); } catch(e) {} bcastUpstream = null; }
-  bcastQueue = Buffer.alloc(0);
+  bcastQueue = Buffer.alloc(0); bcastJoinBuf = Buffer.alloc(0);
   const url = nd.streamUrl(songId);
   axios.get(url, { responseType: 'stream', timeout: 0 })
     .then(upstream => {
+      // Use content-length / duration for exact bytes-per-second
+      const fileSize = parseInt(upstream.headers['content-length'] || '0');
+      if (fileSize > 0 && duration > 0) {
+        bcastBPS = fileSize / duration;
+        console.log('broadcast', Math.round(bcastBPS*8/1000), 'kbps (',
+          Math.round(fileSize/1024)+'KB /', duration+'s)');
+      } else {
+        bcastBPS = 16000;
+      }
+      bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS);
       bcastUpstream = upstream.data;
       upstream.data.on('data', chunk => { bcastQueue = Buffer.concat([bcastQueue, chunk]); });
       upstream.data.on('end',  () => { bcastUpstream = null; });
@@ -57,7 +74,7 @@ function startBroadcast(songId) {
 function stopBroadcast() {
   if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
   if (bcastUpstream) { try { bcastUpstream.destroy(); } catch (e) {} bcastUpstream = null; }
-  bcastQueue = Buffer.alloc(0);
+  bcastQueue = Buffer.alloc(0); bcastJoinBuf = Buffer.alloc(0);
   bcastClients.forEach(res => { try { res.end(); } catch (e) {} });
   bcastClients.clear();
 }
@@ -225,7 +242,7 @@ app.post('/api/player/next', auth.adminMiddleware, (req, res) => {
   db.removeFromQueue(next.id);
   db.setNowPlaying(next);
   lastProgress = { position: 0 };
-  startBroadcast(next.id);
+  startBroadcast(next.id, next.duration || 0);
   broadcast();
   res.json({ song: next });
 });
@@ -237,6 +254,8 @@ app.get('/api/live', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
+  // Send rolling join buffer so late joiners start playing immediately
+  if (bcastJoinBuf.length > 0) res.write(Buffer.from(bcastJoinBuf));
   bcastClients.add(res);
   req.on('close', () => { bcastClients.delete(res); });
   req.socket.on('error', () => { bcastClients.delete(res); });
