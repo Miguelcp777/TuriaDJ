@@ -166,7 +166,7 @@ app.delete('/api/queue/:id', auth.adminMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
-app.get('/api/now-playing', (req, res) => res.json(db.getNowPlaying()));
+app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res.json(song ? { ...song, position: lastProgress.position } : null); });
 
 app.post('/api/player/next', auth.adminMiddleware, (req, res) => {
   const queue = db.getQueue();
@@ -174,13 +174,15 @@ app.post('/api/player/next', auth.adminMiddleware, (req, res) => {
   const next = queue[0];
   db.removeFromQueue(next.id);
   db.setNowPlaying(next);
+  lastProgress = { position: 0 };
   broadcast();
   res.json({ song: next });
 });
 
 app.get('/api/stream/:id', async (req, res) => {
   try {
-    const url = nd.streamUrl(req.params.id);
+    const offset = parseInt(req.query.timeOffset || '0', 10) || 0;
+    const url = nd.streamUrl(req.params.id, offset);
     const headers = {};
     if (req.headers.range) headers['Range'] = req.headers.range;
     const upstream = await axios.get(url, { responseType: 'stream', headers, timeout: 10000 });
@@ -207,11 +209,13 @@ app.get('/api/cover/:id', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/dist/index.html')));
 
+let lastProgress = { position: 0 };
+
 io.on('connection', socket => {
   socket.emit('queue:update',   db.getQueue());
   socket.emit('player:update',  db.getNowPlaying());
   socket.emit('session:update', { active: db.getSessionActive(), name: db.getSessionName(), desc: db.getSessionDesc() });
-  socket.on('player:progress', data => socket.broadcast.emit('player:progress', data));
+  socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
 });
 
 const PORT = process.env.PORT || 3001;

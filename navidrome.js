@@ -39,6 +39,6 @@ async function getRandomSongs(size = 100) {
 
 module.exports = {
   search, getPlaylists, getPlaylistSongs, getRandomSongs,
-  streamUrl: (id) => BASE() + '/rest/stream.view?id=' + id + '&format=mp3&' + auth(),
+  streamUrl: (id, offset = 0) => BASE() + '/rest/stream.view?id=' + id + '&format=mp3' + (offset > 0 ? '&timeOffset=' + Math.floor(offset) : '') + '&' + auth(),
   coverUrl:  (id) => BASE() + '/rest/getCoverArt.view?id=' + id + '&size=400&' + auth(),
 };
