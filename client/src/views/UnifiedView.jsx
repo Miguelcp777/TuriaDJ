@@ -606,7 +606,7 @@ export default function UnifiedView() {
         audioA.current.src = liveUrl;
         audioA.current.volume = 1;
       }
-      await audioA.current.play();
+      audioA.current.play().catch(() => {});
       setVoterListening(true);
     } catch(e) {
       console.warn('startListening error:', e);

@@ -18,7 +18,7 @@ app.use(express.json());
 // Streams one Navidrome song to all voter clients at real-time bitrate.
 // Rate-limiter sends BYTES_PER_TICK every TICK_MS — default 192 kbps.
 const TICK_MS       = 50;   // 50 ms ticks for smooth delivery
-const JOIN_BUF_SECS = 2;    // seconds of audio kept for late joiners
+const JOIN_BUF_SECS = 0.5;  // seconds of audio kept for late joiners
 
 let bcastClients    = new Set();
 let bcastQueue      = Buffer.alloc(0);
