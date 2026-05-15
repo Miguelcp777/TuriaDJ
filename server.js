@@ -13,6 +13,52 @@ const server = http.createServer(app);
 const io     = new Server(server, { cors: { origin: '*' } });
 
 app.use(express.json());
+
+// ── Live broadcast engine ────────────────────────────────────────────────────
+// Streams one Navidrome song to all voter clients at real-time bitrate.
+// Rate-limiter sends BYTES_PER_TICK every TICK_MS — default 192 kbps.
+const TICK_MS        = 100;
+const BROADCAST_BPS  = 192 * 1024 / 8; // 192 kbps = 24000 B/s
+const BYTES_PER_TICK = Math.ceil(BROADCAST_BPS * TICK_MS / 1000); // ~2400 B
+
+let bcastClients  = new Set();
+let bcastQueue    = Buffer.alloc(0);
+let bcastTicker   = null;
+let bcastUpstream = null;
+
+function bcastTick() {
+  if (bcastQueue.length === 0) return;
+  const chunk = bcastQueue.slice(0, BYTES_PER_TICK);
+  bcastQueue  = bcastQueue.slice(BYTES_PER_TICK);
+  const dead  = [];
+  bcastClients.forEach(res => {
+    try { res.write(chunk); } catch (e) { dead.push(res); }
+  });
+  dead.forEach(r => bcastClients.delete(r));
+}
+
+function startBroadcast(songId) {
+  stopBroadcast();
+  const url = nd.streamUrl(songId);
+  axios.get(url, { responseType: 'stream', timeout: 0 })
+    .then(upstream => {
+      bcastUpstream = upstream.data;
+      upstream.data.on('data', chunk => { bcastQueue = Buffer.concat([bcastQueue, chunk]); });
+      upstream.data.on('end',  () => { bcastUpstream = null; });
+      upstream.data.on('error', () => { bcastUpstream = null; });
+      bcastTicker = setInterval(bcastTick, TICK_MS);
+    })
+    .catch(err => console.error('broadcast start error:', err.message));
+}
+
+function stopBroadcast() {
+  if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
+  if (bcastUpstream) { try { bcastUpstream.destroy(); } catch (e) {} bcastUpstream = null; }
+  bcastQueue = Buffer.alloc(0);
+  bcastClients.forEach(res => { try { res.end(); } catch (e) {} });
+  bcastClients.clear();
+}
+
 app.use(express.static(path.join(__dirname, 'client/dist')));
 
 // Seed admin on first run
@@ -94,6 +140,7 @@ app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
 });
 
 app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
+  stopBroadcast();
   db.setSessionActive(false);
   db.clearAll();
   io.emit('session:update', { active: false, name: db.getSessionName(), desc: db.getSessionDesc() });
@@ -175,8 +222,18 @@ app.post('/api/player/next', auth.adminMiddleware, (req, res) => {
   db.removeFromQueue(next.id);
   db.setNowPlaying(next);
   lastProgress = { position: 0 };
+  startBroadcast(next.id);
   broadcast();
   res.json({ song: next });
+});
+
+app.get('/api/live', (req, res) => {
+  res.setHeader('Content-Type', 'audio/mpeg');
+  res.setHeader('Cache-Control', 'no-cache, no-store');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  bcastClients.add(res);
+  req.on('close', () => { bcastClients.delete(res); });
 });
 
 app.get('/api/stream/:id', async (req, res) => {

@@ -516,7 +516,7 @@ export default function UnifiedView() {
         setIsPlaying(false); setCurrentTime(0); setDuration(0);
         setVoterListening(false);
       } else if (currentUser?.role !== 'admin') {
-        // voter: auto-switch if already listening
+        // voter: reconnect to live broadcast on song change
         setVoterListeningSong(song);
       }
     });
@@ -559,20 +559,17 @@ export default function UnifiedView() {
 
   // voter: switch to new song if listening (called from player:update)
   const setVoterListeningSong = (song) => {
-    if (!audioA.current || !song) return;
-    audioA.current.src = '/api/stream/' + song.id;
+    if (!audioA.current || !song || !voterListening) return;
+    // Reconnect to broadcast — server has already switched the stream
+    audioA.current.src = '/api/live?t=' + Date.now();
     audioA.current.load();
     audioA.current.play().catch(() => {});
   };
 
   const startListening = async () => {
     try {
-      const r = await fetch('/api/now-playing');
-      const song = await r.json();
-      if (!song || !audioA.current) return;
-      const offset = Math.max(0, Math.floor((song.position || 0) - 1));
-      const src = '/api/stream/' + song.id + (offset > 0 ? '?timeOffset=' + offset : '');
-      audioA.current.src = src;
+      if (!audioA.current) return;
+      audioA.current.src = '/api/live';
       audioA.current.volume = 1;
       audioA.current.load();
       await audioA.current.play();
