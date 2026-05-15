@@ -54,10 +54,10 @@ function AuthModal({ onAuth }) {
 
   return (
     <div className="min-h-[100dvh] flex items-center justify-center px-4"
-      style={{ background: 'linear-gradient(160deg, #1a0505 0%, #0d0608 100%)' }}>
+      style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
       <div className="w-full max-w-sm">
         <div className="flex flex-col items-center mb-8">
-          <img src={LOGO} className="w-20 h-20 object-contain rounded-full bg-white p-1 mb-4 shadow-xl shadow-red-900/30" alt="Falla" />
+          <img src="/dj_falla.png" className="w-48 h-36 object-cover rounded-2xl mb-5 shadow-2xl shadow-red-900/50" alt="DJ Falla Edition" />
           <h1 className="text-3xl font-extrabold tracking-tight">TuriaDJ</h1>
           <p className="text-xs text-red-400 font-semibold uppercase tracking-widest mt-1">Falla Turia · Plaça de l'Ajuntament</p>
         </div>
@@ -830,7 +830,7 @@ export default function UnifiedView() {
   }, [nowPlaying, isAdmin]);
   // ── render ─────────────────────────────────────────────────────────────────
   if (authLoading || (currentUser && sessionActive === null)) return (
-    <div className="min-h-[100dvh] flex items-center justify-center" style={{ background: '#0d0608' }}>
+    <div className="min-h-[100dvh] flex items-center justify-center" style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
       <div className="w-8 h-8 border-2 border-red-700 border-t-transparent rounded-full animate-spin" />
     </div>
   );
@@ -839,8 +839,8 @@ export default function UnifiedView() {
   // Non-admin waiting screen when session is closed
   if (!isAdmin && !sessionActive) return (
     <div className="min-h-[100dvh] flex flex-col items-center justify-center fade-in px-6"
-      style={{ background: 'linear-gradient(160deg, #1a0505 0%, #0d0608 100%)' }}>
-      <img src={LOGO} className="w-28 h-28 object-contain rounded-full bg-white/5 p-3 mb-8" alt="" />
+      style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
+      <img src="/dj_falla.png" className="w-56 h-40 object-cover rounded-2xl mb-8 shadow-2xl shadow-red-900/50" alt="DJ Falla Edition" />
       <h1 className="text-3xl font-extrabold text-white mb-1 tracking-tight">
         {sessionName || 'TuriaDJ'}
       </h1>
@@ -863,7 +863,7 @@ export default function UnifiedView() {
 
   return (
     <div className="min-h-[100dvh] text-white flex flex-col max-w-2xl mx-auto px-4 pb-10"
-      style={{ background: 'linear-gradient(160deg, #1a0505 0%, #0d0608 40%, #0d0608 100%)' }}>
+      style={{ background: "linear-gradient(rgba(13,6,8,0.80),rgba(13,6,8,0.85)), url('/dj_falla.png') center/cover no-repeat" }}>
 
       {adminPanelOpen && (
         <AdminPanel currentUser={currentUser} authToken={authToken} onClose={() => setAdminPanelOpen(false)} />
