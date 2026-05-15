@@ -1045,9 +1045,14 @@ export default function UnifiedView() {
         {nowPlaying ? (
           <>
             <div className="flex items-center gap-4 mb-4">
-              <CoverImg id={nowPlaying.cover_art_id} size="lg" />
+              <div className="relative flex-shrink-0">
+                <CoverImg id={nowPlaying.cover_art_id} size="lg" />
+                {autoDJActive && (
+                  <div className="absolute bottom-1 left-1 bg-red-700/90 text-white text-[9px] font-bold px-1.5 py-0.5 rounded tracking-wide">AUTO</div>
+                )}
+              </div>
               <div className="flex-1 min-w-0">
-                <p className="text-[10px] text-red-400 font-semibold uppercase tracking-widest mb-1">Sonando ahora</p>
+                <p className="text-[10px] text-red-400 font-semibold uppercase tracking-widest mb-1">{autoDJActive ? 'AutoDJ' : 'Sonando ahora'}</p>
                 <p className="font-bold text-base truncate">{nowPlaying.title}</p>
                 <p className="text-gray-400 text-sm truncate">{nowPlaying.artist}</p>
                 {nowPlaying.album && nowPlaying.album !== '[Unknown Album]' &&

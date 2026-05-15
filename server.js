@@ -161,12 +161,26 @@ app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
 
 app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
   stopBroadcast();
+  autoDJActive = false;
   db.setSessionActive(false);
   db.clearAll();
   io.emit('session:update', { active: false, name: db.getSessionName(), desc: db.getSessionDesc() });
   io.emit('queue:update', []);
   io.emit('player:update', null);
+  io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
   res.json({ success: true });
+});
+
+app.get('/api/autodj/status', (req, res) => {
+  res.json({ enabled: db.getAutoDJEnabled(), active: autoDJActive });
+});
+
+app.post('/api/autodj/toggle', auth.adminMiddleware, (req, res) => {
+  const enabled = !db.getAutoDJEnabled();
+  db.setAutoDJEnabled(enabled);
+  if (!enabled && autoDJActive) { autoDJActive = false; }
+  io.emit('autodj:update', { enabled, active: autoDJActive });
+  res.json({ enabled });
 });
 
 // ── Music ─────────────────────────────────────────────────────────────────────
@@ -235,15 +249,40 @@ app.delete('/api/queue/:id', auth.adminMiddleware, (req, res) => {
 
 app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res.json(song ? { ...song, position: lastProgress.position } : null); });
 
-app.post('/api/player/next', auth.adminMiddleware, (req, res) => {
+app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
   const queue = db.getQueue();
-  if (!queue.length) { db.clearNowPlaying(); broadcast(); return res.json({ song: null }); }
+  if (!queue.length) {
+    if (db.getAutoDJEnabled()) {
+      // AutoDJ: pick a random song from Navidrome
+      try {
+        const songs = await nd.getRandomSongs(20);
+        if (!songs.length) { db.clearNowPlaying(); autoDJActive = false; broadcast(); io.emit('autodj:update', { enabled: true, active: false }); return res.json({ song: null }); }
+        const pick = songs[Math.floor(Math.random() * songs.length)];
+        db.setNowPlaying(pick);
+        lastProgress = { position: 0 };
+        startBroadcast(pick.id, pick.duration || 0);
+        autoDJActive = true;
+        broadcast();
+        io.emit('autodj:update', { enabled: true, active: true });
+        return res.json({ song: pick });
+      } catch(e) {
+        console.error('AutoDJ error:', e.message);
+        db.clearNowPlaying(); autoDJActive = false; broadcast();
+        io.emit('autodj:update', { enabled: true, active: false });
+        return res.json({ song: null });
+      }
+    }
+    db.clearNowPlaying(); autoDJActive = false; broadcast();
+    return res.json({ song: null });
+  }
   const next = queue[0];
   db.removeFromQueue(next.id);
   db.setNowPlaying(next);
   lastProgress = { position: 0 };
   startBroadcast(next.id, next.duration || 0);
+  autoDJActive = false;
   broadcast();
+  io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
   res.json({ song: next });
 });
 
@@ -291,12 +330,14 @@ app.get('/api/cover/:id', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/dist/index.html')));
 
-let lastProgress = { position: 0 };
+let lastProgress  = { position: 0 };
+let autoDJActive  = false;
 
 io.on('connection', socket => {
   socket.emit('queue:update',   db.getQueue());
   socket.emit('player:update',  db.getNowPlaying());
   socket.emit('session:update', { active: db.getSessionActive(), name: db.getSessionName(), desc: db.getSessionDesc() });
+  socket.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: autoDJActive });
   socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
 });
 
