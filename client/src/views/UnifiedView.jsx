@@ -553,11 +553,21 @@ export default function UnifiedView() {
     socket.on('autodj:update', ({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); });
     fetch('/api/autodj/status').then(r => r.json()).then(({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); }).catch(() => {});
     socket.on('users:online', (data) => setOnlineUsers(data));
+    // Remote control: admin audio responds to player:cmd from RemoteView
+    if (currentUser?.role === 'admin') {
+      socket.on('player:cmd', ({ action, value }) => {
+        const audio = getActive();
+        if (!audio) return;
+        if (action === 'play')  audio.play().catch(() => {});
+        else if (action === 'pause') audio.pause();
+        else if (action === 'volume' && value !== undefined) audio.volume = value;
+      });
+    }
     // Emit user:join now and re-emit on every reconnect
     const emitJoin = () => socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
     emitJoin();
     socket.on('connect', emitJoin);
-    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); socket.off('connect', emitJoin); };
+    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); socket.off('player:cmd'); socket.off('connect', emitJoin); };
   }, [authToken, currentUser]);
 
   useEffect(() => {
@@ -1369,8 +1379,8 @@ export default function UnifiedView() {
       <audio ref={audioA} playsInline
         onEnded={() => handleEnded('A')}
         onTimeUpdate={() => handleTimeUpdate('A')}
-        onPlay={() => { if (activeRef.current === 'A') setIsPlaying(true); }}
-        onPause={() => { if (activeRef.current === 'A' && !fadeScheduled.current) setIsPlaying(false); }}
+        onPlay={() => { if (activeRef.current === 'A') { setIsPlaying(true);  socket.emit('player:state', { playing: true }); } }}
+        onPause={() => { if (activeRef.current === 'A' && !fadeScheduled.current) { setIsPlaying(false); socket.emit('player:state', { playing: false }); } }}
         onLoadedMetadata={() => { if (activeRef.current === 'A') setDuration(audioA.current?.duration || 0); }}
       />
       <audio ref={audioB} playsInline

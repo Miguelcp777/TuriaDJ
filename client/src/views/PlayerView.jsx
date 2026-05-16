@@ -27,6 +27,13 @@ export default function PlayerView() {
         audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
       }
     });
+    socket.on('player:cmd', ({ action, value }) => {
+      if (!audioRef.current) return;
+      if (action === 'play')   audioRef.current.play().then(() => setIsPlaying(true)).catch(() => {});
+      else if (action === 'pause')  { audioRef.current.pause(); setIsPlaying(false); }
+      else if (action === 'volume' && value !== undefined) audioRef.current.volume = value;
+      else if (action === 'next')   handleSkip();
+    });
     // Load initial state
     fetch('/api/now-playing').then(r => r.json()).then(song => {
       if (song) {
@@ -37,7 +44,7 @@ export default function PlayerView() {
       }
     });
     fetch('/api/queue').then(r => r.json()).then(setQueue);
-    return () => { socket.off('queue:update'); socket.off('player:update'); };
+    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:cmd'); };
   }, []);
 
   const handleEnded = async () => {
@@ -184,7 +191,8 @@ export default function PlayerView() {
       </div>
 
       <audio ref={audioRef} onEnded={handleEnded} onTimeUpdate={handleTimeUpdate}
-        onPlay={() => setIsPlaying(true)} onPause={() => setIsPlaying(false)} />
+        onPlay={() => { setIsPlaying(true);  socket.emit('player:state', { playing: true }); }}
+        onPause={() => { setIsPlaying(false); socket.emit('player:state', { playing: false }); }} />
     </div>
   );
 }

@@ -355,10 +355,19 @@ io.on('connection', socket => {
     broadcastOnline();
   });
 
+  socket.on('user:leave', () => {
+    onlineUsers.delete(socket.id);
+    broadcastOnline();
+  });
+
   socket.on('disconnect', () => {
     onlineUsers.delete(socket.id);
     broadcastOnline();
   });
+
+  // Remote control: relay commands to player and state back to remote
+  socket.on('player:cmd',   cmd  => socket.broadcast.emit('player:cmd', cmd));
+  socket.on('player:state', data => socket.broadcast.emit('player:state', data));
 
   socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
 });
