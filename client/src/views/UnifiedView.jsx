@@ -980,8 +980,8 @@ export default function UnifiedView() {
   );
 
   return (
-    <div className="min-h-[100dvh] text-white flex flex-col max-w-2xl mx-auto px-4 pb-10"
-      style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat" }}>
+    <div className="min-h-[100dvh] text-white flex flex-col max-w-2xl mx-auto px-4"
+      style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat", paddingBottom: 'max(2.5rem, env(safe-area-inset-bottom))' }}>
 
       {/* Online users panel */}
       {showOnlinePanel && isAdmin && (
