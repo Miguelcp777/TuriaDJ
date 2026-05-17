@@ -493,6 +493,17 @@ export default function UnifiedView() {
   const [browseSongs, setBrowseSongs]           = useState([]);
   const [browseLoading, setBrowseLoading]       = useState(false);
 
+  // ── add song modal ──────────────────────────────────────────────────────────
+  const [addModalOpen, setAddModalOpen] = useState(false);
+  const [addModalTab,  setAddModalTab]  = useState('search');
+  const [confirmSong,  setConfirmSong]  = useState(null);
+
+  const openAddModal = () => {
+    setAddModalOpen(true); setAddModalTab('search');
+    setQ(''); setResults([]); setConfirmSong(null);
+  };
+  const closeAddModal = () => { setAddModalOpen(false); setConfirmSong(null); };
+
   // ── toast ──────────────────────────────────────────────────────────────────
   const [toast, setToast] = useState(null);
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
@@ -1231,98 +1242,177 @@ export default function UnifiedView() {
         )}
       </div>
 
-      {/* Search */}
-      <div ref={searchRef} className="relative z-20 mb-4">
-        <p className="text-xs text-gray-600 font-semibold uppercase tracking-widest mb-2">Buscar canciones</p>
-        <div className="relative">
-          <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 z-10" />
-          <input value={q}
-            onChange={e => { setQ(e.target.value); doSearch(e.target.value); }}
-            onFocus={() => { if (results.length > 0) setShowResults(true); }}
-            placeholder="Busca canciones, artistas, albums..."
-            className="w-full bg-gray-900/80 border border-gray-700/50 focus:border-red-600/60 rounded-xl pl-9 pr-10 py-3 text-sm focus:outline-none placeholder-gray-600 transition-colors" />
-          {q && (
-            <button onClick={() => { setQ(''); setResults([]); setShowResults(false); }}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white">
-              <X size={16} />
-            </button>
-          )}
-        </div>
-        {showResults && (
-          <div className="absolute top-full left-0 right-0 mt-1 bg-gray-900 border border-gray-700/50 rounded-xl shadow-2xl z-50 overflow-hidden">
-            <div className="max-h-72 overflow-y-auto rounded-xl">
-              {searching && <div className="flex justify-center py-6"><div className="w-5 h-5 border-2 border-red-600 border-t-transparent rounded-full animate-spin" /></div>}
-              {!searching && results.length === 0 && <p className="text-center py-6 text-gray-500 text-sm">Sin resultados</p>}
-              {!searching && results.map(song => (
-                <button key={song.id}
-                  onClick={() => { handleAddSong(song); setQ(''); setShowResults(false); setResults([]); }}
-                  disabled={addedSongs.has(song.id) || !!queue.find(s => s.id === song.id)}
-                  className={'w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-800 transition-colors text-left border-b border-gray-800/40 last:border-0 ' +
-                    (addedSongs.has(song.id) || queue.find(s => s.id === song.id) ? 'opacity-40 cursor-default' : 'cursor-pointer')}>
-                  <CoverImg id={song.coverArt} size="sm" />
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium truncate">{song.title}</p>
-                    <p className="text-xs text-gray-400 truncate">{song.artist}{song.album ? ' · ' + song.album : ''}</p>
-                  </div>
-                  {addedSongs.has(song.id) || queue.find(s => s.id === song.id)
-                    ? <span className="text-xs text-gray-500 flex-shrink-0">En cola</span>
-                    : <Plus size={16} className="text-red-400 flex-shrink-0" />}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
+      {/* Add Song Button */}
+      <div className="mb-5">
+        <button onClick={openAddModal}
+          className="w-full flex items-center justify-center gap-2 py-3.5 rounded-2xl text-white font-semibold text-sm transition-all active:scale-95"
+          style={{ background: 'linear-gradient(135deg,#dc2626,#b91c1c)', boxShadow: '0 4px 20px rgba(220,38,38,0.3)' }}>
+          <Plus size={18} />
+          Añadir canción
+        </button>
       </div>
 
-      {/* Library */}
-      <div className="relative z-10 mb-5">
-        <button onClick={toggleLibrary} className="flex items-center gap-2 w-full text-left mb-3 group">
-          <p className="text-xs text-gray-600 font-semibold uppercase tracking-widest group-hover:text-gray-400 transition-colors">Biblioteca</p>
-          <ChevronDown size={13} className={'text-gray-600 group-hover:text-gray-400 transition-all ' + (libraryOpen ? 'rotate-180' : '')} />
-        </button>
-        {libraryOpen && (
-          <div className="fade-in">
-            <div className="flex flex-wrap gap-2 pb-2 mb-3">
-              <button onClick={() => loadBrowse(null)}
-                className={'px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all flex-shrink-0 ' +
-                  (selectedPlaylist === null ? 'bg-red-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white')}>
-                Aleatorio
-              </button>
-              {playlists.map(pl => (
-                <button key={pl.id} onClick={() => loadBrowse(pl.id)}
-                  className={'px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all flex-shrink-0 ' +
-                    (selectedPlaylist === pl.id ? 'bg-red-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white')}>
-                  {pl.name}<span className="ml-1 opacity-40 font-normal">{pl.count}</span>
-                </button>
-              ))}
-            </div>
-            <div className="max-h-80 overflow-y-auto space-y-0.5">
-              {browseLoading && <div className="flex justify-center py-10"><div className="w-6 h-6 border-2 border-red-600 border-t-transparent rounded-full animate-spin" /></div>}
-              {!browseLoading && browseSongs.length === 0 && <p className="text-center py-8 text-gray-600 text-sm">Sin canciones</p>}
-              {!browseLoading && browseSongs.map(song => {
-                const inQueue = !!queue.find(s => s.id === song.id);
-                const added   = addedSongs.has(song.id);
-                return (
-                  <button key={song.id} onClick={() => { if (!inQueue && !added) handleAddSong(song); }}
-                    disabled={inQueue || added}
-                    className={'w-full flex items-center gap-3 px-3 py-2.5 rounded-xl transition-colors text-left group/item ' +
-                      (inQueue || added ? 'opacity-40 cursor-default' : 'hover:bg-gray-800/60 cursor-pointer')}>
-                    <CoverImg id={song.coverArt} size="sm" />
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium truncate">{song.title}</p>
-                      <p className="text-xs text-gray-500 truncate">{song.artist}{song.album ? ' · ' + song.album : ''}</p>
-                    </div>
-                    <div className="flex-shrink-0">
-                      {inQueue || added ? <span className="text-xs text-gray-600">En cola</span>
-                        : <Plus size={15} className="text-gray-600 group-hover/item:text-red-400 transition-colors" />}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
+      {/* Add Song Modal */}
+      {addModalOpen && (
+        <div className="fixed inset-0 z-50 flex flex-col bg-[#0b0b14]">
+
+          {/* Header */}
+          <div className="flex items-center gap-3 px-4 py-4 border-b border-gray-800/60 flex-shrink-0">
+            <button onClick={closeAddModal} className="text-gray-400 hover:text-white transition-colors p-1">
+              <ArrowLeft size={20} />
+            </button>
+            <h2 className="font-bold text-base flex-1">Añadir canción</h2>
           </div>
-        )}
-      </div>
+
+          {/* Tabs */}
+          <div className="flex border-b border-gray-800/60 flex-shrink-0">
+            {[['search','Buscar'],['library','Biblioteca']].map(([tab, label]) => (
+              <button key={tab}
+                onClick={() => { setAddModalTab(tab); if (tab === 'library' && browseSongs.length === 0) loadBrowse(null); }}
+                className={'flex-1 py-3 text-sm font-semibold transition-colors border-b-2 ' +
+                  (addModalTab === tab ? 'text-red-500 border-red-600' : 'text-gray-500 border-transparent hover:text-gray-300')}>
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Content */}
+          <div className="flex-1 overflow-y-auto">
+
+            {/* Search tab */}
+            {addModalTab === 'search' && (
+              <div className="p-4">
+                <div className="relative mb-4">
+                  <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 z-10" />
+                  <input value={q} autoFocus
+                    onChange={e => { setQ(e.target.value); doSearch(e.target.value); }}
+                    placeholder="Canciones, artistas, álbumes..."
+                    className="w-full bg-gray-900 border border-gray-700/50 focus:border-red-600/60 rounded-xl pl-9 pr-10 py-3 text-sm focus:outline-none placeholder-gray-600 transition-colors" />
+                  {q && (
+                    <button onClick={() => { setQ(''); setResults([]); }}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white">
+                      <X size={16} />
+                    </button>
+                  )}
+                </div>
+                {!q && (
+                  <div className="text-center py-14">
+                    <Search size={36} className="text-gray-700 mx-auto mb-3" />
+                    <p className="text-gray-600 text-sm">Escribe para buscar</p>
+                  </div>
+                )}
+                {q && searching && <div className="flex justify-center py-10"><div className="w-5 h-5 border-2 border-red-600 border-t-transparent rounded-full animate-spin" /></div>}
+                {q && !searching && results.length === 0 && <p className="text-center py-10 text-gray-500 text-sm">Sin resultados</p>}
+                {q && !searching && results.length > 0 && (
+                  <div className="space-y-0.5">
+                    {results.map(song => {
+                      const inQueue = !!queue.find(s => s.id === song.id);
+                      const added   = addedSongs.has(song.id);
+                      return (
+                        <button key={song.id}
+                          onClick={() => { if (!inQueue && !added) setConfirmSong(song); }}
+                          disabled={inQueue || added}
+                          className={'w-full flex items-center gap-3 px-2 py-3 rounded-xl transition-colors text-left ' +
+                            (inQueue || added ? 'opacity-40 cursor-default' : 'hover:bg-gray-800/60 cursor-pointer')}>
+                          <CoverImg id={song.coverArt} size="sm" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium truncate">{song.title}</p>
+                            <p className="text-xs text-gray-400 truncate">{song.artist}{song.album ? ' · ' + song.album : ''}</p>
+                          </div>
+                          {inQueue || added
+                            ? <span className="text-xs text-gray-500 flex-shrink-0">En cola</span>
+                            : <Plus size={16} className="text-gray-500 flex-shrink-0" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Library tab */}
+            {addModalTab === 'library' && (
+              <div className="p-4">
+                <div className="flex flex-wrap gap-2 mb-4">
+                  <button onClick={() => loadBrowse(null)}
+                    className={'px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all ' +
+                      (selectedPlaylist === null ? 'bg-red-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white')}>
+                    Aleatorio
+                  </button>
+                  {playlists.map(pl => (
+                    <button key={pl.id} onClick={() => loadBrowse(pl.id)}
+                      className={'px-3 py-1.5 rounded-full text-xs font-semibold whitespace-nowrap transition-all ' +
+                        (selectedPlaylist === pl.id ? 'bg-red-700 text-white' : 'bg-gray-800 text-gray-400 hover:bg-gray-700 hover:text-white')}>
+                      {pl.name}<span className="ml-1 opacity-40 font-normal">{pl.count}</span>
+                    </button>
+                  ))}
+                </div>
+                {browseLoading && <div className="flex justify-center py-12"><div className="w-6 h-6 border-2 border-red-600 border-t-transparent rounded-full animate-spin" /></div>}
+                {!browseLoading && browseSongs.length === 0 && <p className="text-center py-10 text-gray-600 text-sm">Sin canciones</p>}
+                {!browseLoading && browseSongs.length > 0 && (
+                  <div className="space-y-0.5">
+                    {browseSongs.map(song => {
+                      const inQueue = !!queue.find(s => s.id === song.id);
+                      const added   = addedSongs.has(song.id);
+                      return (
+                        <button key={song.id}
+                          onClick={() => { if (!inQueue && !added) setConfirmSong(song); }}
+                          disabled={inQueue || added}
+                          className={'w-full flex items-center gap-3 px-2 py-3 rounded-xl transition-colors text-left ' +
+                            (inQueue || added ? 'opacity-40 cursor-default' : 'hover:bg-gray-800/60 cursor-pointer')}>
+                          <CoverImg id={song.coverArt} size="sm" />
+                          <div className="flex-1 min-w-0">
+                            <p className="text-sm font-medium truncate">{song.title}</p>
+                            <p className="text-xs text-gray-500 truncate">{song.artist}{song.album ? ' · ' + song.album : ''}</p>
+                          </div>
+                          {inQueue || added
+                            ? <span className="text-xs text-gray-600 flex-shrink-0">En cola</span>
+                            : <Plus size={15} className="text-gray-500 flex-shrink-0" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Confirmation bottom sheet */}
+          {confirmSong && (
+            <div className="absolute inset-0 bg-black/70 flex items-end z-10" onClick={() => setConfirmSong(null)}>
+              <div className="w-full bg-[#111118] rounded-t-3xl p-6 pb-8" onClick={e => e.stopPropagation()}>
+                <div className="w-10 h-1 bg-gray-700 rounded-full mx-auto mb-6" />
+                <div className="flex items-center gap-4 mb-5">
+                  <div className="w-16 h-16 rounded-xl overflow-hidden flex-shrink-0 bg-gray-800">
+                    {confirmSong.coverArt
+                      ? <img src={'/api/cover/' + confirmSong.coverArt} className="w-full h-full object-cover" alt="" />
+                      : <div className="w-full h-full flex items-center justify-center"><Music size={22} className="text-gray-600"/></div>}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <p className="font-bold text-white truncate">{confirmSong.title}</p>
+                    <p className="text-sm text-gray-400 truncate mt-0.5">{confirmSong.artist}</p>
+                    {confirmSong.album && <p className="text-xs text-gray-600 truncate mt-0.5">{confirmSong.album}</p>}
+                  </div>
+                </div>
+                <p className="text-sm text-gray-500 text-center mb-5">¿Añadir esta canción a la cola?</p>
+                <div className="flex gap-3">
+                  <button onClick={() => setConfirmSong(null)}
+                    className="flex-1 py-3.5 rounded-2xl bg-gray-800 hover:bg-gray-700 text-gray-300 font-semibold text-sm transition-colors">
+                    Cancelar
+                  </button>
+                  <button
+                    onClick={() => { handleAddSong(confirmSong); setConfirmSong(null); closeAddModal(); }}
+                    className="flex-1 py-3.5 rounded-2xl text-white font-semibold text-sm transition-all active:scale-95"
+                    style={{ background: 'linear-gradient(135deg,#dc2626,#b91c1c)' }}>
+                    Añadir a la cola
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+        </div>
+      )}
 
       {/* Queue */}
       <div className="relative z-10">
