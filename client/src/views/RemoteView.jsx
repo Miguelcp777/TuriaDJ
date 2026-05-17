@@ -31,7 +31,7 @@ function LoginForm({ onAuth }) {
   };
 
   return (
-    <div className="min-h-screen bg-[#07070f] flex items-center justify-center p-4">
+    <div className="min-h-[100dvh] bg-[#07070f] flex items-center justify-center p-4">
       <div className="w-full max-w-xs">
         <div className="flex items-center gap-2 mb-8 justify-center">
           <div className="w-10 h-10 rounded-2xl flex items-center justify-center" style={{ background: 'linear-gradient(135deg,#dc2626,#b91c1c)' }}>
@@ -135,7 +135,7 @@ export default function RemoteView() {
   const pct = progress.duration > 0 ? Math.min(100, (progress.position / progress.duration) * 100) : 0;
 
   if (authLoading) return (
-    <div className="min-h-screen bg-[#07070f] flex items-center justify-center">
+    <div className="min-h-[100dvh] bg-[#07070f] flex items-center justify-center">
       <div className="w-6 h-6 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
     </div>
   );
@@ -143,7 +143,8 @@ export default function RemoteView() {
   if (!user) return <LoginForm onAuth={handleAuth} />;
 
   return (
-    <div className="min-h-screen bg-[#07070f] text-white flex flex-col max-w-sm mx-auto px-4 pb-8 pt-6 select-none">
+    <div className="min-h-[100dvh] bg-[#07070f] text-white flex flex-col max-w-sm mx-auto px-4 pt-6 select-none"
+      style={{ paddingBottom: 'max(2rem, env(safe-area-inset-bottom))' }}>
 
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
