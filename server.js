@@ -289,8 +289,8 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
 // ── Spooty: proxy Spotify download requests to internal Spooty service ────────
 app.post('/api/spooty/download', auth.authMiddleware, async (req, res) => {
   const { spotifyUrl } = req.body || {};
-  if (!spotifyUrl || !/open\.spotify\.com\/(track|playlist|album)\//.test(spotifyUrl))
-    return res.status(400).json({ error: 'URL de Spotify inválida. Usa un enlace de canción, álbum o playlist.' });
+  if (!spotifyUrl || !/open\.spotify\.com\/track\//.test(spotifyUrl))
+    return res.status(400).json({ error: 'Solo se permiten canciones individuales. Pega el enlace de una canción de Spotify (no playlists ni álbumes).' });
   try {
     await axios.post('http://localhost:3000/api/playlist', { spotifyUrl }, { timeout: 8000 });
     res.json({ success: true });

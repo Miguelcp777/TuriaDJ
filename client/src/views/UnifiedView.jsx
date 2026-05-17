@@ -1374,7 +1374,7 @@ export default function UnifiedView() {
                   </div>
                   <div>
                     <p className="font-bold text-white">Descargar de Spotify</p>
-                    <p className="text-xs text-gray-400 mt-0.5">Canción, álbum o playlist</p>
+                    <p className="text-xs text-gray-400 mt-0.5">Solo canciones individuales</p>
                   </div>
                 </div>
 
@@ -1384,15 +1384,18 @@ export default function UnifiedView() {
                     <input
                       value={spootyUrl}
                       onChange={e => setSpootyUrl(e.target.value)}
-                      placeholder="https://open.spotify.com/track/..."
+                      placeholder="https://open.spotify.com/track/4uLU6h..."
                       className="w-full bg-gray-900 border border-gray-700/50 focus:border-green-600/60 rounded-xl px-4 py-3 text-sm focus:outline-none placeholder-gray-600 transition-colors mb-3"
                     />
+                    {spootyUrl && !/open\.spotify\.com\/track\//.test(spootyUrl) && (
+                      <p className="text-yellow-500 text-xs mb-3">Solo se admiten canciones individuales, no playlists ni álbumes.</p>
+                    )}
                     {spootyStatus === 'error' && (
                       <p className="text-red-400 text-xs mb-3">{spootyError}</p>
                     )}
                     <button
                       onClick={handleSpootySubmit}
-                      disabled={spootyStatus === 'loading' || !spootyUrl.trim()}
+                      disabled={spootyStatus === 'loading' || !/open\.spotify\.com\/track\//.test(spootyUrl)}
                       className="w-full py-3.5 rounded-2xl text-white font-semibold text-sm transition-all active:scale-95 disabled:opacity-40"
                       style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
                       {spootyStatus === 'loading' ? (
