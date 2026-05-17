@@ -286,6 +286,20 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
   res.json({ song: next });
 });
 
+// ── Spooty: proxy Spotify download requests to internal Spooty service ────────
+app.post('/api/spooty/download', auth.authMiddleware, async (req, res) => {
+  const { spotifyUrl } = req.body || {};
+  if (!spotifyUrl || !/open\.spotify\.com\/(track|playlist|album)\//.test(spotifyUrl))
+    return res.status(400).json({ error: 'URL de Spotify inválida. Usa un enlace de canción, álbum o playlist.' });
+  try {
+    await axios.post('http://localhost:3000/api/playlist', { spotifyUrl }, { timeout: 8000 });
+    res.json({ success: true });
+  } catch (e) {
+    console.error('Spooty proxy error:', e.message);
+    res.status(502).json({ error: 'No se pudo conectar con el descargador. Inténtalo de nuevo.' });
+  }
+});
+
 app.get('/api/live', (req, res) => {
   req.socket.setTimeout(0);        // no idle timeout for live stream
   req.socket.setNoDelay(true);     // flush each chunk immediately

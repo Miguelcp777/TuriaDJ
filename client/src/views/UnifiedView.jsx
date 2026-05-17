@@ -502,7 +502,23 @@ export default function UnifiedView() {
     setAddModalOpen(true); setAddModalTab('search');
     setQ(''); setResults([]); setConfirmSong(null);
   };
-  const closeAddModal = () => { setAddModalOpen(false); setConfirmSong(null); };
+  const closeAddModal = () => { setAddModalOpen(false); setConfirmSong(null); setSpootyOpen(false); setSpootyStatus('idle'); };
+
+  // ── spooty spotify download ─────────────────────────────────────────────────
+  const [spootyOpen,   setSpootyOpen]   = useState(false);
+  const [spootyUrl,    setSpootyUrl]    = useState('');
+  const [spootyStatus, setSpootyStatus] = useState('idle'); // idle | loading | success | error
+  const [spootyError,  setSpootyError]  = useState('');
+
+  const handleSpootySubmit = async () => {
+    setSpootyStatus('loading'); setSpootyError('');
+    try {
+      const r = await authFetch('/api/spooty/download', { method: 'POST', body: JSON.stringify({ spotifyUrl: spootyUrl.trim() }) });
+      const data = await r.json();
+      if (!r.ok) { setSpootyStatus('error'); setSpootyError(data.error || 'Error'); return; }
+      setSpootyStatus('success');
+    } catch { setSpootyStatus('error'); setSpootyError('Error de conexión'); }
+  };
 
   // ── toast ──────────────────────────────────────────────────────────────────
   const [toast, setToast] = useState(null);
@@ -1325,6 +1341,80 @@ export default function UnifiedView() {
                         </button>
                       );
                     })}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Spotify download banner – shown at bottom of search tab */}
+            {addModalTab === 'search' && !spootyOpen && (
+              <button onClick={() => { setSpootyOpen(true); setSpootyUrl(''); setSpootyStatus('idle'); }}
+                className="mx-4 mb-4 mt-2 w-[calc(100%-2rem)] flex items-center gap-3 px-4 py-3.5 rounded-2xl border border-gray-700/50 bg-gray-900/60 hover:bg-gray-800/70 transition-colors text-left">
+                <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="white"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-white">¿No encuentras tu canción?</p>
+                  <p className="text-xs text-gray-400 mt-0.5">Descárgala de Spotify →</p>
+                </div>
+              </button>
+            )}
+
+            {/* Spooty overlay – Spotify URL input */}
+            {spootyOpen && (
+              <div className="flex flex-col h-full p-4">
+                <button onClick={() => { setSpootyOpen(false); setSpootyStatus('idle'); }}
+                  className="flex items-center gap-1.5 text-sm text-gray-400 hover:text-white transition-colors mb-6 self-start">
+                  <ArrowLeft size={16} /> Volver a búsqueda
+                </button>
+
+                <div className="flex items-center gap-3 mb-6">
+                  <div className="w-10 h-10 rounded-2xl flex items-center justify-center flex-shrink-0" style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="white"><path d="M12 0C5.4 0 0 5.4 0 12s5.4 12 12 12 12-5.4 12-12S18.66 0 12 0zm5.521 17.34c-.24.359-.66.48-1.021.24-2.82-1.74-6.36-2.101-10.561-1.141-.418.122-.779-.179-.899-.539-.12-.421.18-.78.54-.9 4.56-1.021 8.52-.6 11.64 1.32.42.18.479.659.301 1.02zm1.44-3.3c-.301.42-.841.6-1.262.3-3.239-1.98-8.159-2.58-11.939-1.38-.479.12-1.02-.12-1.14-.6-.12-.48.12-1.021.6-1.141C9.6 9.9 15 10.561 18.72 12.84c.361.181.54.78.241 1.2zm.12-3.36C15.24 8.4 8.82 8.16 5.16 9.301c-.6.179-1.2-.181-1.38-.721-.18-.601.18-1.2.72-1.381 4.26-1.26 11.28-1.02 15.721 1.621.539.3.719 1.02.419 1.56-.299.421-1.02.599-1.559.3z"/></svg>
+                  </div>
+                  <div>
+                    <p className="font-bold text-white">Descargar de Spotify</p>
+                    <p className="text-xs text-gray-400 mt-0.5">Canción, álbum o playlist</p>
+                  </div>
+                </div>
+
+                {spootyStatus !== 'success' ? (
+                  <>
+                    <p className="text-sm text-gray-400 mb-3">Pega el enlace de Spotify:</p>
+                    <input
+                      value={spootyUrl}
+                      onChange={e => setSpootyUrl(e.target.value)}
+                      placeholder="https://open.spotify.com/track/..."
+                      className="w-full bg-gray-900 border border-gray-700/50 focus:border-green-600/60 rounded-xl px-4 py-3 text-sm focus:outline-none placeholder-gray-600 transition-colors mb-3"
+                    />
+                    {spootyStatus === 'error' && (
+                      <p className="text-red-400 text-xs mb-3">{spootyError}</p>
+                    )}
+                    <button
+                      onClick={handleSpootySubmit}
+                      disabled={spootyStatus === 'loading' || !spootyUrl.trim()}
+                      className="w-full py-3.5 rounded-2xl text-white font-semibold text-sm transition-all active:scale-95 disabled:opacity-40"
+                      style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
+                      {spootyStatus === 'loading' ? (
+                        <span className="flex items-center justify-center gap-2">
+                          <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin inline-block" />
+                          Enviando petición...
+                        </span>
+                      ) : 'Solicitar descarga'}
+                    </button>
+                    <p className="text-xs text-gray-600 text-center mt-3">La descarga puede tardar unos minutos</p>
+                  </>
+                ) : (
+                  <div className="flex-1 flex flex-col items-center justify-center text-center px-4">
+                    <div className="w-16 h-16 rounded-full flex items-center justify-center mb-4" style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
+                      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                    </div>
+                    <p className="font-bold text-white text-lg mb-2">¡Petición recibida!</p>
+                    <p className="text-gray-400 text-sm leading-relaxed">La canción estará disponible en Navidrome en unos minutos. Búscala de nuevo en un momento.</p>
+                    <button onClick={() => { setSpootyOpen(false); setSpootyStatus('idle'); setSpootyUrl(''); }}
+                      className="mt-6 px-6 py-2.5 rounded-xl bg-gray-800 text-gray-300 text-sm font-semibold hover:bg-gray-700 transition-colors">
+                      Volver a búsqueda
+                    </button>
                   </div>
                 )}
               </div>
