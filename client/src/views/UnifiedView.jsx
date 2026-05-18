@@ -516,8 +516,7 @@ export default function UnifiedView() {
       const r = await authFetch('/api/spooty/download', { method: 'POST', body: JSON.stringify({ spotifyUrl: spootyUrl.trim() }) });
       const data = await r.json();
       if (!r.ok) { setSpootyStatus('error'); setSpootyError(data.error || 'Error'); return; }
-      setSpootyOpen(false); setSpootyUrl(''); setSpootyStatus('idle');
-      showToast('Tu cancion se esta descargando, este proceso puede tardar varios minutos, disfruta de la musica que suena mientras tanto 😊', 9000);
+      setSpootyStatus('success');
     } catch { setSpootyStatus('error'); setSpootyError('Error de conexión'); }
   };
 
@@ -595,8 +594,8 @@ export default function UnifiedView() {
     const emitJoin = () => socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
     emitJoin();
     socket.on('connect', emitJoin);
-    socket.on('spooty:ready', ({ message }) => showToast('✅ ' + message, 7000));
-    socket.on('spooty:error', ({ message }) => showToast('❌ ' + message, 5000));
+    socket.on('spooty:ready', ({ message }) => { setSpootyOpen(false); setSpootyStatus('idle'); setSpootyUrl(''); showToast('✅ ' + message, 7000); });
+    socket.on('spooty:error', ({ message }) => { setSpootyStatus('error'); setSpootyError(message); });
     return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); socket.off('player:cmd'); socket.off('spooty:ready'); socket.off('spooty:error'); socket.off('connect', emitJoin); };
   }, [authToken, currentUser]);
 
@@ -1413,10 +1412,10 @@ export default function UnifiedView() {
                 ) : (
                   <div className="flex-1 flex flex-col items-center justify-center text-center px-4">
                     <div className="w-16 h-16 rounded-full flex items-center justify-center mb-4" style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
-                      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+                      <span className="w-8 h-8 border-4 border-white/40 border-t-white rounded-full animate-spin inline-block" />
                     </div>
-                    <p className="font-bold text-white text-lg mb-2">¡Petición recibida!</p>
-                    <p className="text-gray-400 text-sm leading-relaxed">La canción estará disponible en Navidrome en unos minutos. Búscala de nuevo en un momento.</p>
+                    <p className="font-bold text-white text-lg mb-2">Tu canción se está descargando</p>
+                    <p className="text-gray-400 text-sm leading-relaxed">Este proceso puede tardar varios minutos. Disfruta de la música que suena mientras tanto 😊</p>
                     <button onClick={() => { setSpootyOpen(false); setSpootyStatus('idle'); setSpootyUrl(''); }}
                       className="mt-6 px-6 py-2.5 rounded-xl bg-gray-800 text-gray-300 text-sm font-semibold hover:bg-gray-700 transition-colors">
                       Volver a búsqueda
