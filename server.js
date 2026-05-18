@@ -287,15 +287,23 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
 });
 
 // ── Spooty: proxy Spotify download requests to internal Spooty service ────────
-async function triggerNavidromeScan() {
-  const base = process.env.NAVIDROME_URL || 'http://localhost:4533';
-  const u    = process.env.NAVIDROME_USER || 'admin';
-  const p    = process.env.NAVIDROME_PASS || 'admin';
-  const authStr = 'u=' + u + '&p=' + p + '&v=1.16.1&c=jukevote&f=json';
-  await axios.get(base + '/rest/startScan.view?' + authStr, { timeout: 10000 });
-  for (let i = 0; i < 24; i++) {
-    await new Promise(r => setTimeout(r, 10000));
-    const { data } = await axios.get(base + '/rest/getScanStatus.view?' + authStr, { timeout: 10000 });
+function ndAuthStr() {
+  const u = process.env.NAVIDROME_USER || 'admin';
+  const p = process.env.NAVIDROME_PASS || 'admin';
+  return 'u=' + u + '&p=' + p + '&v=1.16.1&c=jukevote&f=json';
+}
+function ndBase() { return process.env.NAVIDROME_URL || 'http://localhost:4533'; }
+
+async function ndSongCount() {
+  const { data } = await axios.get(ndBase() + '/rest/getScanStatus.view?' + ndAuthStr(), { timeout: 10000 });
+  return data?.['subsonic-response']?.scanStatus?.count ?? -1;
+}
+
+async function ndRunScan() {
+  await axios.get(ndBase() + '/rest/startScan.view?' + ndAuthStr(), { timeout: 10000 });
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 5000));
+    const { data } = await axios.get(ndBase() + '/rest/getScanStatus.view?' + ndAuthStr(), { timeout: 10000 });
     if (!data?.['subsonic-response']?.scanStatus?.scanning) break;
   }
 }
@@ -307,9 +315,19 @@ app.post('/api/spooty/download', auth.authMiddleware, async (req, res) => {
   res.json({ success: true });
   (async () => {
     try {
-      await axios.post('http://localhost:3000/api/playlist', { spotifyUrl }, { timeout: 180000 });
-      await triggerNavidromeScan();
-      io.emit('spooty:ready', { message: 'Tu canción ya está disponible. Búscala en el buscador.' });
+      const baseline = await ndSongCount().catch(() => -1);
+      await axios.post('http://localhost:3000/api/playlist', { spotifyUrl }, { timeout: 30000 });
+      // Poll until Navidrome song count grows (max ~10 min, scan every 30 s)
+      for (let attempt = 0; attempt < 20; attempt++) {
+        await new Promise(r => setTimeout(r, 30000));
+        await ndRunScan().catch(() => {});
+        const count = await ndSongCount().catch(() => -1);
+        if (baseline >= 0 && count > baseline) {
+          io.emit('spooty:ready', { message: 'Tu canción ya está disponible. Búscala en el buscador.' });
+          return;
+        }
+      }
+      io.emit('spooty:error', { message: 'La descarga tardó demasiado. Inténtalo de nuevo.' });
     } catch (e) {
       console.error('Spooty background error:', e.message);
       io.emit('spooty:error', { message: 'Error al descargar la canción. Inténtalo de nuevo.' });
