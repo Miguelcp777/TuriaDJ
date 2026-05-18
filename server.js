@@ -308,6 +308,36 @@ async function ndRunScan() {
   }
 }
 
+app.get('/api/spooty/track-info', auth.authMiddleware, async (req, res) => {
+  const { url } = req.query;
+  if (!url || !/open\.spotify\.com\/track\//.test(url))
+    return res.status(400).json({ error: 'URL inválida' });
+  try {
+    let title = '', artist = '', thumbnail = '';
+    const oembed = await axios.get(
+      'https://open.spotify.com/oembed?url=' + encodeURIComponent(url),
+      { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } }
+    );
+    title     = oembed.data.title || '';
+    thumbnail = oembed.data.thumbnail_url || '';
+    try {
+      const page = await axios.get(url.split('?')[0], {
+        timeout: 8000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)' }
+      });
+      const m = page.data.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/);
+      if (m) {
+        const ld = JSON.parse(m[1]);
+        if (ld.byArtist?.name) artist = ld.byArtist.name;
+        else if (Array.isArray(ld.byArtist) && ld.byArtist[0]?.name) artist = ld.byArtist[0].name;
+      }
+    } catch {}
+    res.json({ title, artist, thumbnail });
+  } catch (e) {
+    res.status(502).json({ error: 'No se pudo obtener información de la canción.' });
+  }
+});
+
 app.post('/api/spooty/download', auth.authMiddleware, async (req, res) => {
   const { spotifyUrl } = req.body || {};
   if (!spotifyUrl || !/open\.spotify\.com\/track\//.test(spotifyUrl))

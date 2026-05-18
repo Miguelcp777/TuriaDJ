@@ -509,15 +509,22 @@ export default function UnifiedView() {
   const [spootyUrl,    setSpootyUrl]    = useState('');
   const [spootyStatus, setSpootyStatus] = useState('idle'); // idle | loading | success | error
   const [spootyError,  setSpootyError]  = useState('');
+  const [spootyTrackInfo, setSpootyTrackInfo] = useState(null);
 
   const handleSpootySubmit = async () => {
     setSpootyStatus('loading'); setSpootyError('');
     try {
-      const r = await authFetch('/api/spooty/download', { method: 'POST', body: JSON.stringify({ spotifyUrl: spootyUrl.trim() }) });
+      const r = await authFetch('/api/spooty/track-info?url=' + encodeURIComponent(spootyUrl.trim()));
       const data = await r.json();
-      if (!r.ok) { setSpootyStatus('error'); setSpootyError(data.error || 'Error'); return; }
-      setSpootyStatus('success');
+      if (!r.ok) { setSpootyStatus('error'); setSpootyError(data.error || 'No se pudo obtener info de la canción'); return; }
+      setSpootyTrackInfo(data);
+      setSpootyStatus('confirm');
     } catch { setSpootyStatus('error'); setSpootyError('Error de conexión'); }
+  };
+
+  const handleSpootyConfirm = () => {
+    setSpootyStatus('success');
+    authFetch('/api/spooty/download', { method: 'POST', body: JSON.stringify({ spotifyUrl: spootyUrl.trim() }) }).catch(() => {});
   };
 
   // ── toast ──────────────────────────────────────────────────────────────────
@@ -1381,6 +1388,29 @@ export default function UnifiedView() {
                 </div>
 
                 {spootyStatus !== 'success' ? (
+                  spootyStatus === 'confirm' && spootyTrackInfo ? (
+                    <div className="flex flex-col items-center text-center px-2">
+                      {spootyTrackInfo.thumbnail && (
+                        <img src={spootyTrackInfo.thumbnail} alt="cover" className="w-28 h-28 rounded-2xl mb-4 object-cover shadow-lg" />
+                      )}
+                      <p className="text-white font-bold text-base mb-1">{spootyTrackInfo.title || 'Canción de Spotify'}</p>
+                      {spootyTrackInfo.artist && (
+                        <p className="text-gray-400 text-sm mb-4">{spootyTrackInfo.artist}</p>
+                      )}
+                      <p className="text-gray-300 text-sm mb-6">¿Quieres descargar esta canción?</p>
+                      <div className="flex gap-3 w-full">
+                        <button onClick={() => setSpootyStatus('idle')}
+                          className="flex-1 py-3 rounded-xl bg-gray-800 text-gray-300 text-sm font-semibold hover:bg-gray-700 transition-colors">
+                          Cancelar
+                        </button>
+                        <button onClick={handleSpootyConfirm}
+                          className="flex-1 py-3 rounded-xl text-white font-semibold text-sm active:scale-95 transition-all"
+                          style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
+                          Descargar
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
                   <>
                     <p className="text-sm text-gray-400 mb-3">Pega el enlace de Spotify:</p>
                     <input
@@ -1403,12 +1433,13 @@ export default function UnifiedView() {
                       {spootyStatus === 'loading' ? (
                         <span className="flex items-center justify-center gap-2">
                           <span className="w-4 h-4 border-2 border-white/40 border-t-white rounded-full animate-spin inline-block" />
-                          Enviando petición...
+                          Buscando canción...
                         </span>
                       ) : 'Solicitar descarga'}
                     </button>
                     <p className="text-xs text-gray-600 text-center mt-3">La descarga puede tardar unos minutos</p>
                   </>
+                  )
                 ) : (
                   <div className="flex-1 flex flex-col items-center justify-center text-center px-4">
                     <div className="w-16 h-16 rounded-full flex items-center justify-center mb-4" style={{ background: 'linear-gradient(135deg,#1ed760,#17a84a)' }}>
