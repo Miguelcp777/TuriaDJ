@@ -517,7 +517,7 @@ export default function UnifiedView() {
       const data = await r.json();
       if (!r.ok) { setSpootyStatus('error'); setSpootyError(data.error || 'Error'); return; }
       setSpootyOpen(false); setSpootyUrl(''); setSpootyStatus('idle');
-      showToast('Descarga en progreso... te avisaremos cuando este lista.');
+      showToast('Tu cancion se esta descargando, este proceso puede tardar varios minutos, disfruta de la musica que suena mientras tanto 😊', 9000);
     } catch { setSpootyStatus('error'); setSpootyError('Error de conexión'); }
   };
 
