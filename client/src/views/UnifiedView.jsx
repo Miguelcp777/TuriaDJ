@@ -516,13 +516,14 @@ export default function UnifiedView() {
       const r = await authFetch('/api/spooty/download', { method: 'POST', body: JSON.stringify({ spotifyUrl: spootyUrl.trim() }) });
       const data = await r.json();
       if (!r.ok) { setSpootyStatus('error'); setSpootyError(data.error || 'Error'); return; }
-      setSpootyStatus('success');
+      setSpootyOpen(false); setSpootyUrl(''); setSpootyStatus('idle');
+      showToast('Descarga en progreso... te avisaremos cuando este lista.');
     } catch { setSpootyStatus('error'); setSpootyError('Error de conexión'); }
   };
 
   // ── toast ──────────────────────────────────────────────────────────────────
   const [toast, setToast] = useState(null);
-  const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(null), 3000); };
+  const showToast = (msg, ms = 3000) => { setToast(msg); setTimeout(() => setToast(null), ms); };
 
   // ── DJ session ─────────────────────────────────────────────────────────────
   const [sessionActive, setSessionActive]     = useState(null);
@@ -594,7 +595,9 @@ export default function UnifiedView() {
     const emitJoin = () => socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
     emitJoin();
     socket.on('connect', emitJoin);
-    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); socket.off('player:cmd'); socket.off('connect', emitJoin); };
+    socket.on('spooty:ready', ({ message }) => showToast('✅ ' + message, 7000));
+    socket.on('spooty:error', ({ message }) => showToast('❌ ' + message, 5000));
+    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); socket.off('player:cmd'); socket.off('spooty:ready'); socket.off('spooty:error'); socket.off('connect', emitJoin); };
   }, [authToken, currentUser]);
 
   useEffect(() => {

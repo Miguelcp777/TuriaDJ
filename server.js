@@ -287,17 +287,34 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
 });
 
 // ── Spooty: proxy Spotify download requests to internal Spooty service ────────
+async function triggerNavidromeScan() {
+  const base = process.env.NAVIDROME_URL || 'http://localhost:4533';
+  const u    = process.env.NAVIDROME_USER || 'admin';
+  const p    = process.env.NAVIDROME_PASS || 'admin';
+  const authStr = 'u=' + u + '&p=' + p + '&v=1.16.1&c=jukevote&f=json';
+  await axios.get(base + '/rest/startScan.view?' + authStr, { timeout: 10000 });
+  for (let i = 0; i < 24; i++) {
+    await new Promise(r => setTimeout(r, 10000));
+    const { data } = await axios.get(base + '/rest/getScanStatus.view?' + authStr, { timeout: 10000 });
+    if (!data?.['subsonic-response']?.scanStatus?.scanning) break;
+  }
+}
+
 app.post('/api/spooty/download', auth.authMiddleware, async (req, res) => {
   const { spotifyUrl } = req.body || {};
   if (!spotifyUrl || !/open\.spotify\.com\/track\//.test(spotifyUrl))
     return res.status(400).json({ error: 'Solo se permiten canciones individuales. Pega el enlace de una canción de Spotify (no playlists ni álbumes).' });
-  try {
-    await axios.post('http://localhost:3000/api/playlist', { spotifyUrl }, { timeout: 8000 });
-    res.json({ success: true });
-  } catch (e) {
-    console.error('Spooty proxy error:', e.message);
-    res.status(502).json({ error: 'No se pudo conectar con el descargador. Inténtalo de nuevo.' });
-  }
+  res.json({ success: true });
+  (async () => {
+    try {
+      await axios.post('http://localhost:3000/api/playlist', { spotifyUrl }, { timeout: 180000 });
+      await triggerNavidromeScan();
+      io.emit('spooty:ready', { message: 'Tu canción ya está disponible. Búscala en el buscador.' });
+    } catch (e) {
+      console.error('Spooty background error:', e.message);
+      io.emit('spooty:error', { message: 'Error al descargar la canción. Inténtalo de nuevo.' });
+    }
+  })();
 });
 
 app.get('/api/live', (req, res) => {
