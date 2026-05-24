@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
-import { Play, Pause, SkipForward, Volume2, Music, LogOut, Radio } from 'lucide-react';
+import { Play, Pause, SkipForward, Volume2, Music, LogOut, Radio, SlidersHorizontal, ChevronDown, ChevronUp } from 'lucide-react';
 
 const socket = io({ transports: ['websocket'] });
 
@@ -68,6 +68,9 @@ export default function RemoteView() {
   const [isPlaying, setIsPlaying]     = useState(false);
   const [progress, setProgress]       = useState({ position: 0, duration: 0 });
   const [volume, setVolume]           = useState(100);
+  const [silenceThreshold, setSilenceThreshold] = useState(0.02);
+  const [silenceSeconds, setSilenceSeconds]     = useState(2);
+  const [showSilence, setShowSilence]           = useState(false);
   const skipBusy = useRef(false);
 
   // Auth check
@@ -127,6 +130,16 @@ export default function RemoteView() {
   const handleVolume = v => {
     setVolume(v);
     cmd('volume', v / 100);
+  };
+
+  const handleSilenceThreshold = v => {
+    setSilenceThreshold(v);
+    cmd('silence-threshold', v);
+  };
+
+  const handleSilenceSeconds = v => {
+    setSilenceSeconds(v);
+    cmd('silence-seconds', v);
   };
 
   const handleAuth = (token, u) => { setAuthToken(token); setUser(u); };
@@ -215,6 +228,54 @@ export default function RemoteView() {
             className="flex-1 accent-red-600 h-1.5 rounded-full cursor-pointer" />
           <span className="text-xs text-gray-500 w-7 text-right">{volume}</span>
         </div>
+      </div>
+
+      {/* Silence config — PV-003 */}
+      <div className="mb-6">
+        <button
+          onClick={() => setShowSilence(v => !v)}
+          className="flex items-center gap-2 text-gray-500 hover:text-gray-300 transition-colors w-full"
+        >
+          <SlidersHorizontal size={14} />
+          <span className="text-xs font-semibold uppercase tracking-widest">Detección de silencio</span>
+          {showSilence ? <ChevronUp size={14} className="ml-auto" /> : <ChevronDown size={14} className="ml-auto" />}
+        </button>
+
+        {showSilence && (
+          <div className="mt-3 space-y-4 bg-gray-900/50 rounded-xl p-4 border border-gray-800/40">
+            <div>
+              <div className="flex justify-between text-xs text-gray-500 mb-2">
+                <span>Umbral de silencio</span>
+                <span className="text-gray-300 font-mono">{silenceThreshold.toFixed(3)}</span>
+              </div>
+              <input
+                type="range" min={0.005} max={0.08} step={0.005}
+                value={silenceThreshold}
+                onChange={e => handleSilenceThreshold(Number(e.target.value))}
+                className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer"
+              />
+              <div className="flex justify-between text-xs text-gray-700 mt-1">
+                <span>sensible</span><span>tolerante</span>
+              </div>
+            </div>
+
+            <div>
+              <div className="flex justify-between text-xs text-gray-500 mb-2">
+                <span>Segundos de silencio</span>
+                <span className="text-gray-300 font-mono">{silenceSeconds.toFixed(1)} s</span>
+              </div>
+              <input
+                type="range" min={0.5} max={5} step={0.5}
+                value={silenceSeconds}
+                onChange={e => handleSilenceSeconds(Number(e.target.value))}
+                className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer"
+              />
+              <div className="flex justify-between text-xs text-gray-700 mt-1">
+                <span>rápido</span><span>conservador</span>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Queue preview */}

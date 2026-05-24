@@ -415,6 +415,11 @@ let autoDJActive  = false;
 // Online users: socketId -> { username, role }
 const onlineUsers = new Map();
 
+// Chat
+const chatMessages  = [];          // in-memory, last 50
+let   chatEnabled   = true;
+const chatRateLimit = new Map();   // socketId -> last message timestamp ms
+
 function broadcastOnline() {
   const list = [...onlineUsers.values()];
   io.emit('users:online', { count: list.length, users: list });
@@ -441,6 +446,7 @@ io.on('connection', socket => {
 
   socket.on('disconnect', () => {
     onlineUsers.delete(socket.id);
+    chatRateLimit.delete(socket.id);
     broadcastOnline();
   });
 
@@ -449,6 +455,37 @@ io.on('connection', socket => {
   socket.on('player:state', data => socket.broadcast.emit('player:state', data));
 
   socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
+
+  // Chat: send history to new connection
+  socket.emit('chat:history', { messages: chatMessages, enabled: chatEnabled });
+
+  socket.on('chat:send', ({ text }) => {
+    if (!chatEnabled) return;
+    if (!text || typeof text !== 'string') return;
+    const clean = text.trim().slice(0, 200);
+    if (!clean) return;
+    // Rate limit: 1 message per second per socket
+    const now = Date.now();
+    if (now - (chatRateLimit.get(socket.id) || 0) < 1000) return;
+    chatRateLimit.set(socket.id, now);
+    const user = onlineUsers.get(socket.id);
+    const msg = { username: user?.username || 'Anónimo', text: clean, at: now };
+    chatMessages.push(msg);
+    if (chatMessages.length > 50) chatMessages.shift();
+    io.emit('chat:message', msg);
+  });
+
+  socket.on('chat:clear', () => {
+    if (onlineUsers.get(socket.id)?.role !== 'admin') return;
+    chatMessages.length = 0;
+    io.emit('chat:clear');
+  });
+
+  socket.on('chat:toggle', () => {
+    if (onlineUsers.get(socket.id)?.role !== 'admin') return;
+    chatEnabled = !chatEnabled;
+    io.emit('chat:toggle', { enabled: chatEnabled });
+  });
 });
 
 const PORT = process.env.PORT || 3001;
