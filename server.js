@@ -460,23 +460,18 @@ io.on('connection', socket => {
   socket.emit('chat:history', { messages: chatMessages, enabled: chatEnabled });
 
   socket.on('chat:send', ({ text }) => {
-    console.log('[chat] chat:send received, enabled:', chatEnabled, 'text:', text);
     if (!chatEnabled) return;
     if (!text || typeof text !== 'string') return;
     const clean = text.trim().slice(0, 200);
     if (!clean) return;
     const now = Date.now();
-    const lastMsg = chatRateLimit.get(socket.id) || 0;
-    console.log('[chat] rate limit check:', now - lastMsg, 'ms since last msg');
-    if (now - lastMsg < 1000) { console.log('[chat] rate limited'); return; }
+    if (now - (chatRateLimit.get(socket.id) || 0) < 1000) return;
     chatRateLimit.set(socket.id, now);
     const user = onlineUsers.get(socket.id);
     const msg = { username: user?.username || 'Anónimo', text: clean, at: now };
-    console.log('[chat] broadcasting message:', msg);
     chatMessages.push(msg);
     if (chatMessages.length > 50) chatMessages.shift();
     io.emit('chat:message', msg);
-    console.log('[chat] message emitted to all sockets');
   });
 
   socket.on('chat:clear', () => {
