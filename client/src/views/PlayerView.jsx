@@ -11,6 +11,15 @@ const SILENCE_SECONDS   = 2;      // valor por defecto
 const SILENCE_WINDOW    = 60;
 const PRELOAD_WINDOW    = 90;     // segundos antes del final donde se precarga la siguiente
 
+// Fetch autenticado — lee el JWT del mismo localStorage que el admin panel
+const jwtFetch = (url, opts = {}) => {
+  const token = localStorage.getItem('jv_auth') || '';
+  return fetch(url, {
+    ...opts,
+    headers: { ...(opts.headers || {}), 'Authorization': 'Bearer ' + token },
+  });
+};
+
 function fmtDur(s) {
   if (!s || isNaN(s)) return '0:00';
   const m = Math.floor(s / 60), sec = Math.floor(s % 60);
@@ -219,7 +228,7 @@ export default function PlayerView() {
     if (!isSilence) setIsPlaying(false);
 
     try {
-      const r = await fetch('/api/player/next', { method: 'POST' });
+      const r = await jwtFetch('/api/player/next', { method: 'POST' });
       const { song } = await r.json();
       if (song) {
         if (isSilence && !getActive()?.ended) doCrossfade(song);
@@ -330,7 +339,7 @@ export default function PlayerView() {
         }
       }
     });
-    fetch('/api/queue').then(r => r.json()).then(updateQueue);
+    jwtFetch('/api/queue').then(r => r.json()).then(updateQueue);
 
     return () => {
       socket.off('queue:update');
