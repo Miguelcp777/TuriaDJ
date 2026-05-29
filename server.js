@@ -306,11 +306,11 @@ app.post('/api/player/silence-config', auth.adminMiddleware, (req, res) => {
 
 app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res.json(song ? { ...song, position: lastProgress.position } : null); });
 
-app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
+// ── advanceQueue: lógica de avance compartida entre HTTP y socket ─────────────
+async function advanceQueue() {
   const queue = db.getQueue();
   if (!queue.length) {
     if (db.getAutoDJEnabled()) {
-      // AutoDJ: pick a song from selected playlists (or random if none selected)
       try {
         const selectedPlaylists = db.getAutoDJPlaylists();
         let songs = [];
@@ -320,7 +320,11 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
         } else {
           songs = await nd.getRandomSongs(20);
         }
-        if (!songs.length) { db.clearNowPlaying(); autoDJActive = false; broadcast(); io.emit('autodj:update', { enabled: true, active: false }); return res.json({ song: null }); }
+        if (!songs.length) {
+          db.clearNowPlaying(); autoDJActive = false; broadcast();
+          io.emit('autodj:update', { enabled: true, active: false });
+          return null;
+        }
         const pick = songs[Math.floor(Math.random() * songs.length)];
         db.setNowPlaying(pick);
         lastProgress = { position: 0 };
@@ -328,16 +332,16 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
         autoDJActive = true;
         broadcast();
         io.emit('autodj:update', { enabled: true, active: true });
-        return res.json({ song: pick });
-      } catch(e) {
+        return pick;
+      } catch (e) {
         console.error('AutoDJ error:', e.message);
         db.clearNowPlaying(); autoDJActive = false; broadcast();
         io.emit('autodj:update', { enabled: true, active: false });
-        return res.json({ song: null });
+        return null;
       }
     }
     db.clearNowPlaying(); autoDJActive = false; broadcast();
-    return res.json({ song: null });
+    return null;
   }
   const next = queue[0];
   db.removeFromQueue(next.id);
@@ -347,7 +351,17 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
   autoDJActive = false;
   broadcast();
   io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
-  res.json({ song: next });
+  return next;
+}
+
+app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
+  try {
+    const song = await advanceQueue();
+    res.json({ song });
+  } catch (e) {
+    console.error('player/next error:', e.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
 });
 
 // ── Spooty: proxy Spotify download requests to internal Spooty service ────────
@@ -551,6 +565,19 @@ io.on('connection', socket => {
   socket.on('player:state', data => socket.broadcast.emit('player:state', data));
 
   socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
+
+  // Avance automático desde PlayerView — sin auth, el servidor valida que haya sesión activa
+  socket.on('player:auto-next', async (_, cb) => {
+    if (typeof cb !== 'function') return;
+    if (!db.getSessionActive() && !db.getAutoDJEnabled()) return cb({ song: null });
+    try {
+      const song = await advanceQueue();
+      cb({ song });
+    } catch (e) {
+      console.error('player:auto-next error:', e.message);
+      cb({ song: null });
+    }
+  });
 
   // Silence config: send persisted values to new connection
   socket.emit('player:silence-config', {

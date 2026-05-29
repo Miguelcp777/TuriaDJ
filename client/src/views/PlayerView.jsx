@@ -225,48 +225,49 @@ export default function PlayerView() {
   };
 
   // ── handleEnded ──────────────────────────────────────────────────────────
-  // fromSkip = true  → switch inmediato (el usuario pulsó "siguiente")
+  // fromSkip = true  → switch inmediato (el DJ pulsó "siguiente")
   // fromSkip = false → crossfade 4s  (fin natural o silencio detectado)
-  const handleEnded = async (fromSkip = false) => {
+  //
+  // El avance automático usa socket.emit con acknowledgment para evitar
+  // depender de auth HTTP — PlayerView puede estar abierto sin sesión de admin.
+  const handleEnded = (fromSkip = false) => {
     if (advancingRef.current) return;
     advancingRef.current = true;
     stopSilenceMonitor();
     setIsPlaying(false);
 
-    // Guard: si algo falla y el mutex queda bloqueado, liberarlo en 20s
+    // Guard: liberar mutex si el servidor no responde en 15s
     const guard = setTimeout(() => {
       if (advancingRef.current) {
         console.warn('[PlayerView] advance timeout — liberando mutex');
         advancingRef.current = false;
       }
-    }, 20000);
+    }, 15000);
 
-    try {
-      const r = await jwtFetch('/api/player/next', { method: 'POST' });
-      const data = await r.json();
+    const onSong = (song) => {
       clearTimeout(guard);
-      const song = data?.song ?? null;
       if (song) {
-        if (fromSkip) {
-          // Skip del DJ → switch inmediato sin crossfade
-          resetPreload();
-          doImmediateSwitch(song);
-        } else {
-          // Fin natural o silencio → crossfade 4s
-          doCrossfade(song);
-        }
+        if (fromSkip) { resetPreload(); doImmediateSwitch(song); }
+        else            doCrossfade(song);
       } else {
-        // Cola vacía, AutoDJ desactivado
         clearMediaSession();
         setNowPlaying(null);
         setIsPlaying(false);
         advancingRef.current = false;
       }
-    } catch (err) {
-      clearTimeout(guard);
-      console.error('[PlayerView] handleEnded fetch error:', err);
-      advancingRef.current = false;
-      if (getActive()?.paused) setNeedsTap(true);
+    };
+
+    if (fromSkip) {
+      // Skip: usa HTTP con auth (acción admin)
+      jwtFetch('/api/player/next', { method: 'POST' })
+        .then(r => r.json())
+        .then(data => onSong(data?.song ?? null))
+        .catch(() => { clearTimeout(guard); advancingRef.current = false; });
+    } else {
+      // Fin natural: socket acknowledgment sin necesidad de auth
+      socket.emit('player:auto-next', {}, (data) => {
+        onSong(data?.song ?? null);
+      });
     }
   };
 
