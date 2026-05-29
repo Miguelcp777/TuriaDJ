@@ -4,7 +4,7 @@ import { Music, SkipForward, Volume2, Play, Pause } from 'lucide-react';
 
 const socket = io({ transports: ['websocket'] });
 
-const CROSSFADE_MS      = 3000;
+const CROSSFADE_MS      = 4000;
 const CROSSFADE_TICK    = 50;
 const SILENCE_THRESHOLD = 0.02;   // valor por defecto — puede sobreescribirse desde RemoteView
 const SILENCE_SECONDS   = 2;      // valor por defecto
@@ -124,7 +124,7 @@ export default function PlayerView() {
         if (!silenceStart.current) silenceStart.current = Date.now();
         else if (Date.now() - silenceStart.current >= silenceSecondsRef.current * 1000) {
           stopSilenceMonitor();
-          handleEnded(true);
+          handleEnded(false); // fin natural → crossfade
         }
       } else {
         silenceStart.current = null;
@@ -196,11 +196,15 @@ export default function PlayerView() {
       }, CROSSFADE_TICK);
 
     }).catch(() => {
+      // next.play() bloqueado por política de autoplay del navegador.
+      // Limpiar el inactive y hacer switch en el elemento activo para que
+      // togglePlay() funcione cuando el usuario toque la pantalla.
       next.src = '';
-      updateMediaSession(song);   // PV-001: actualizar metadatos aunque no suene
-      setNowPlaying(song);
-      setNeedsTap(true);
-      advancingRef.current = false;
+      next.volume = targetVolRef.current;
+      preloadedRef.current = '';
+      stopCrossfade();
+      // Redirigir al switch inmediato en el elemento activo
+      doImmediateSwitch(song);
     });
   };
 
@@ -221,27 +225,48 @@ export default function PlayerView() {
   };
 
   // ── handleEnded ──────────────────────────────────────────────────────────
-  const handleEnded = async (isSilence = false) => {
+  // fromSkip = true  → switch inmediato (el usuario pulsó "siguiente")
+  // fromSkip = false → crossfade 4s  (fin natural o silencio detectado)
+  const handleEnded = async (fromSkip = false) => {
     if (advancingRef.current) return;
     advancingRef.current = true;
     stopSilenceMonitor();
-    if (!isSilence) setIsPlaying(false);
+    setIsPlaying(false);
+
+    // Guard: si algo falla y el mutex queda bloqueado, liberarlo en 20s
+    const guard = setTimeout(() => {
+      if (advancingRef.current) {
+        console.warn('[PlayerView] advance timeout — liberando mutex');
+        advancingRef.current = false;
+      }
+    }, 20000);
 
     try {
       const r = await jwtFetch('/api/player/next', { method: 'POST' });
-      const { song } = await r.json();
+      const data = await r.json();
+      clearTimeout(guard);
+      const song = data?.song ?? null;
       if (song) {
-        if (isSilence && !getActive()?.ended) doCrossfade(song);
-        else { resetPreload(); doImmediateSwitch(song); }
+        if (fromSkip) {
+          // Skip del DJ → switch inmediato sin crossfade
+          resetPreload();
+          doImmediateSwitch(song);
+        } else {
+          // Fin natural o silencio → crossfade 4s
+          doCrossfade(song);
+        }
       } else {
-        clearMediaSession();    // PV-001
+        // Cola vacía, AutoDJ desactivado
+        clearMediaSession();
         setNowPlaying(null);
         setIsPlaying(false);
         advancingRef.current = false;
       }
-    } catch {
-      if (getActive()?.paused) setNeedsTap(true);
+    } catch (err) {
+      clearTimeout(guard);
+      console.error('[PlayerView] handleEnded fetch error:', err);
       advancingRef.current = false;
+      if (getActive()?.paused) setNeedsTap(true);
     }
   };
 
@@ -258,7 +283,16 @@ export default function PlayerView() {
     socket.on('queue:update', updateQueue);
 
     socket.on('player:update', song => {
+      // ── Race-condition guard ──────────────────────────────────────────────
+      // Cuando PlayerView mismo inicia la transición (handleEnded), el servidor
+      // emite player:update vía broadcast ANTES de que llegue la respuesta HTTP.
+      // Si procesamos ese evento, stopCrossfade() + active.src = X reinician la
+      // canción desde el principio y corrompen el crossfade. Lo ignoramos:
+      // la respuesta HTTP de handleEnded gestionará la transición por completo.
+      if (advancingRef.current) return;
+
       const newSrc = song ? '/api/stream/' + song.id : '';
+      // Si ya estamos en crossfade hacia esta misma canción, solo actualizar UI
       if (crossfadeTimer.current && playingSrcRef.current === newSrc) {
         setNowPlaying(song);
         updateMediaSession(song);   // PV-001
@@ -411,13 +445,13 @@ export default function PlayerView() {
   const handleSkip = () => {
     stopSilenceMonitor();
     stopCrossfade();
-    resetPreload();   // PV-002
+    resetPreload();
     const inactive = getInactive();
     if (inactive) { inactive.pause(); inactive.src = ''; inactive.volume = targetVolRef.current; }
     const active = getActive();
     if (active) active.volume = targetVolRef.current;
-    advancingRef.current = false;
-    handleEnded(false);
+    advancingRef.current = false; // liberar mutex antes de la llamada
+    handleEnded(true); // fromSkip=true → switch inmediato
   };
 
   const togglePlay = () => {
