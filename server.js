@@ -154,12 +154,20 @@ app.post('/api/session/info', auth.adminMiddleware, (req, res) => {
 });
 
 app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
+  const { duration } = req.body || {};
   db.setSessionActive(true);
   io.emit('session:update', { active: true, name: db.getSessionName(), desc: db.getSessionDesc() });
+  if (duration && Number(duration) > 0) {
+    startSessionTimer(Date.now() + Number(duration) * 60 * 1000);
+  } else {
+    db.setSetting('session_end_time', '');
+    io.emit('session:timer', { endsAt: null });
+  }
   res.json({ success: true });
 });
 
 app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
+  clearSessionTimer();
   stopBroadcast();
   autoDJActive = false;
   db.setSessionActive(false);
@@ -168,6 +176,15 @@ app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
   io.emit('queue:update', []);
   io.emit('player:update', null);
   io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
+  res.json({ success: true });
+});
+
+app.post('/api/session/extend', auth.adminMiddleware, (req, res) => {
+  const { minutes } = req.body || {};
+  if (!minutes || Number(minutes) <= 0) return res.status(400).json({ error: 'Minutos inválidos' });
+  const stored = db.getSetting('session_end_time');
+  if (!stored) return res.status(400).json({ error: 'La sesión no tiene duración programada' });
+  startSessionTimer(parseInt(stored) + Number(minutes) * 60 * 1000);
   res.json({ success: true });
 });
 
@@ -458,6 +475,36 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/dist/index.
 
 let lastProgress  = { position: 0 };
 let autoDJActive  = false;
+let sessionTimer  = null;
+
+function autoEndSession() {
+  sessionTimer = null;
+  db.setSetting('session_end_time', '');
+  stopBroadcast();
+  autoDJActive = false;
+  db.setSessionActive(false);
+  db.clearAll();
+  io.emit('session:update', { active: false, name: db.getSessionName(), desc: db.getSessionDesc() });
+  io.emit('queue:update',   []);
+  io.emit('player:update',  null);
+  io.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: false });
+  io.emit('session:timer',  { endsAt: null });
+}
+
+function startSessionTimer(endsAtMs) {
+  if (sessionTimer) { clearTimeout(sessionTimer); sessionTimer = null; }
+  db.setSetting('session_end_time', String(endsAtMs));
+  const delay = endsAtMs - Date.now();
+  if (delay <= 0) { autoEndSession(); return; }
+  sessionTimer = setTimeout(autoEndSession, delay);
+  io.emit('session:timer', { endsAt: endsAtMs });
+}
+
+function clearSessionTimer() {
+  if (sessionTimer) { clearTimeout(sessionTimer); sessionTimer = null; }
+  db.setSetting('session_end_time', '');
+  io.emit('session:timer', { endsAt: null });
+}
 
 // Online users: socketId -> { username, role }
 const onlineUsers = new Map();
@@ -477,6 +524,8 @@ io.on('connection', socket => {
   socket.emit('player:update',  db.getNowPlaying());
   socket.emit('session:update', { active: db.getSessionActive(), name: db.getSessionName(), desc: db.getSessionDesc() });
   socket.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: autoDJActive });
+  const storedEnd = db.getSetting('session_end_time');
+  socket.emit('session:timer',  { endsAt: storedEnd ? parseInt(storedEnd) : null });
   // Send current online list to this socket
   const list = [...onlineUsers.values()];
   socket.emit('users:online', { count: list.length, users: list });
@@ -539,6 +588,12 @@ io.on('connection', socket => {
     io.emit('chat:toggle', { enabled: chatEnabled });
   });
 });
+
+// Recover session timer after server restart
+if (db.getSessionActive()) {
+  const stored = db.getSetting('session_end_time');
+  if (stored) startSessionTimer(parseInt(stored));
+}
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => console.log('TuriaDJ on port', PORT));
