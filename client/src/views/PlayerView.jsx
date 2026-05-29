@@ -279,6 +279,11 @@ export default function PlayerView() {
       }
     });
 
+    socket.on('player:silence-config', ({ threshold, seconds }) => {
+      if (threshold !== undefined) silenceThresholdRef.current = threshold;
+      if (seconds   !== undefined) silenceSecondsRef.current   = seconds;
+    });
+
     socket.on('player:cmd', ({ action, value }) => {
       const active = getActive();
       if (action === 'play' && active) {
@@ -331,6 +336,7 @@ export default function PlayerView() {
       socket.off('queue:update');
       socket.off('player:update');
       socket.off('player:cmd');
+      socket.off('player:silence-config');
       document.removeEventListener('visibilitychange', onVisibility);
       stopSilenceMonitor();
       stopCrossfade();

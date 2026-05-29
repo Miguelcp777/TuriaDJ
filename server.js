@@ -247,6 +247,30 @@ app.delete('/api/queue/:id', auth.adminMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+app.post('/api/queue/:id/pin', auth.adminMiddleware, (req, res) => {
+  db.pinSong(req.params.id);
+  broadcast();
+  res.json({ success: true });
+});
+
+app.delete('/api/queue', auth.adminMiddleware, (req, res) => {
+  db.clearQueue();
+  broadcast();
+  res.json({ success: true });
+});
+
+app.post('/api/player/silence-config', auth.adminMiddleware, (req, res) => {
+  const { threshold, seconds } = req.body;
+  if (threshold !== undefined) db.setSetting('silence_threshold', threshold);
+  if (seconds   !== undefined) db.setSetting('silence_seconds',   seconds);
+  const data = {
+    threshold: parseFloat(db.getSetting('silence_threshold') || 0.02),
+    seconds:   parseFloat(db.getSetting('silence_seconds')   || 2),
+  };
+  io.emit('player:silence-config', data);
+  res.json({ success: true, ...data });
+});
+
 app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res.json(song ? { ...song, position: lastProgress.position } : null); });
 
 app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
@@ -455,6 +479,12 @@ io.on('connection', socket => {
   socket.on('player:state', data => socket.broadcast.emit('player:state', data));
 
   socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
+
+  // Silence config: send persisted values to new connection
+  socket.emit('player:silence-config', {
+    threshold: parseFloat(db.getSetting('silence_threshold') || 0.02),
+    seconds:   parseFloat(db.getSetting('silence_seconds')   || 2),
+  });
 
   // Chat: send history to new connection
   socket.emit('chat:history', { messages: chatMessages, enabled: chatEnabled });

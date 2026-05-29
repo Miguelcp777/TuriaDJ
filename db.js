@@ -35,6 +35,7 @@ db.exec(`
 // Migrations for existing DBs
 const queueCols = db.prepare('PRAGMA table_info(queue)').all().map(c => c.name);
 if (!queueCols.includes('first_voted_at')) db.exec('ALTER TABLE queue ADD COLUMN first_voted_at DATETIME');
+if (!queueCols.includes('priority'))       db.exec('ALTER TABLE queue ADD COLUMN priority INTEGER DEFAULT 0');
 
 module.exports = {
   // ── users ──────────────────────────────────────────────────────────────────
@@ -69,16 +70,23 @@ module.exports = {
 
   // ── queue ──────────────────────────────────────────────────────────────────
   getQueue: () => db.prepare(
-    'SELECT * FROM queue ORDER BY votes DESC, first_voted_at ASC, added_at ASC'
+    'SELECT * FROM queue ORDER BY priority DESC, votes DESC, first_voted_at ASC, added_at ASC'
   ).all(),
   getSong:   (id) => db.prepare('SELECT * FROM queue WHERE id=?').get(id),
   addToQueue(song) {
-    db.prepare('INSERT OR IGNORE INTO queue (id,title,artist,album,duration,cover_art_id,votes) VALUES (?,?,?,?,?,?,0)')
+    db.prepare('INSERT OR IGNORE INTO queue (id,title,artist,album,duration,cover_art_id,votes,priority) VALUES (?,?,?,?,?,?,0,0)')
       .run(song.id, song.title, song.artist, song.album, song.duration, song.coverArt);
+  },
+  pinSong(id) {
+    db.prepare('UPDATE queue SET priority=0').run();
+    db.prepare('UPDATE queue SET priority=1 WHERE id=?').run(id);
   },
   removeFromQueue(id) {
     db.prepare('DELETE FROM queue WHERE id=?').run(id);
     db.prepare('DELETE FROM votes WHERE song_id=?').run(id);
+  },
+  clearQueue() {
+    db.exec('DELETE FROM queue; DELETE FROM votes;');
   },
 
   // ── votes ──────────────────────────────────────────────────────────────────
@@ -109,6 +117,8 @@ module.exports = {
   setSessionDesc: (v) => db.prepare("INSERT OR REPLACE INTO state(key,value) VALUES('session_desc',?)").run(v || ''),
   getAutoDJEnabled() { const r = db.prepare("SELECT value FROM state WHERE key='autodj_enabled'").get(); return r ? r.value === '1' : false; },
   setAutoDJEnabled: (v) => db.prepare("INSERT OR REPLACE INTO state(key,value) VALUES('autodj_enabled',?)").run(v ? '1' : '0'),
+  getSetting(key)       { const r = db.prepare('SELECT value FROM state WHERE key=?').get(key); return r ? r.value : null; },
+  setSetting(key, val)  { db.prepare('INSERT OR REPLACE INTO state(key,value) VALUES(?,?)').run(key, String(val)); },
   clearAll() {
     db.exec('DELETE FROM queue; DELETE FROM votes; DELETE FROM additions;');
     db.prepare("DELETE FROM state WHERE key='current_song'").run();
