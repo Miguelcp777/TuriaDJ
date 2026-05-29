@@ -19,6 +19,8 @@ function CoverImg({ id, size = 'md' }) {
     </div>
   );
   return <img src={'/api/cover/' + id} onError={() => setErr(true)}
+    draggable="false"
+    onContextMenu={e => e.preventDefault()}
     className={'rounded-xl object-cover flex-shrink-0 ' + cls} alt="" />;
 }
 
@@ -1686,9 +1688,15 @@ export default function UnifiedView() {
                   <>
                     <p className="text-sm text-gray-400 mb-3">Pega el enlace de Spotify:</p>
                     <input
+                      type="text"
+                      autoComplete="off"
+                      autoCorrect="off"
+                      autoCapitalize="off"
+                      spellCheck="false"
                       value={spootyUrl}
                       onChange={e => setSpootyUrl(e.target.value)}
-                      placeholder="https://open.spotify.com/track/4uLU6h..."
+                      onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); handleSpootySubmit(); } }}
+                      placeholder="Ej: open.spotify.com/track/..."
                       className="w-full bg-gray-900 border border-gray-700/50 focus:border-green-600/60 rounded-xl px-4 py-3 text-sm focus:outline-none placeholder-gray-600 transition-colors mb-3"
                     />
                     {spootyUrl && !/open\.spotify\.com\/track\//.test(spootyUrl) && (
@@ -1698,6 +1706,7 @@ export default function UnifiedView() {
                       <p className="text-red-400 text-xs mb-3">{spootyError}</p>
                     )}
                     <button
+                      type="button"
                       onClick={handleSpootySubmit}
                       disabled={spootyStatus === 'loading' || !/open\.spotify\.com\/track\//.test(spootyUrl)}
                       className="w-full py-3.5 rounded-2xl text-white font-semibold text-sm transition-all active:scale-95 disabled:opacity-40"
