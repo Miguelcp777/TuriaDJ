@@ -183,6 +183,22 @@ app.post('/api/autodj/toggle', auth.adminMiddleware, (req, res) => {
   res.json({ enabled });
 });
 
+app.get('/api/autodj/playlists', auth.adminMiddleware, async (req, res) => {
+  try {
+    const playlists = await nd.getPlaylists();
+    const selected  = db.getAutoDJPlaylists();
+    res.json({ playlists, selected });
+  } catch (e) { console.error('autodj playlists error:', e.message); res.status(500).json({ error: 'Error interno del servidor' }); }
+});
+
+app.post('/api/autodj/playlists', auth.adminMiddleware, (req, res) => {
+  const { selected } = req.body;
+  if (!Array.isArray(selected)) return res.status(400).json({ error: 'invalid' });
+  db.setAutoDJPlaylists(selected);
+  io.emit('autodj:playlists', { selected });
+  res.json({ success: true, selected });
+});
+
 // ── Music ─────────────────────────────────────────────────────────────────────
 app.get('/api/search', auth.authMiddleware, async (req, res) => {
   const q = (req.query.q || '').trim();
@@ -277,9 +293,16 @@ app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
   const queue = db.getQueue();
   if (!queue.length) {
     if (db.getAutoDJEnabled()) {
-      // AutoDJ: pick a random song from Navidrome
+      // AutoDJ: pick a song from selected playlists (or random if none selected)
       try {
-        const songs = await nd.getRandomSongs(20);
+        const selectedPlaylists = db.getAutoDJPlaylists();
+        let songs = [];
+        if (selectedPlaylists.length > 0) {
+          const playlistId = selectedPlaylists[Math.floor(Math.random() * selectedPlaylists.length)];
+          songs = await nd.getPlaylistSongs(playlistId);
+        } else {
+          songs = await nd.getRandomSongs(20);
+        }
         if (!songs.length) { db.clearNowPlaying(); autoDJActive = false; broadcast(); io.emit('autodj:update', { enabled: true, active: false }); return res.json({ song: null }); }
         const pick = songs[Math.floor(Math.random() * songs.length)];
         db.setNowPlaying(pick);

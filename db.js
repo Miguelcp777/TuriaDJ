@@ -117,6 +117,8 @@ module.exports = {
   setSessionDesc: (v) => db.prepare("INSERT OR REPLACE INTO state(key,value) VALUES('session_desc',?)").run(v || ''),
   getAutoDJEnabled() { const r = db.prepare("SELECT value FROM state WHERE key='autodj_enabled'").get(); return r ? r.value === '1' : false; },
   setAutoDJEnabled: (v) => db.prepare("INSERT OR REPLACE INTO state(key,value) VALUES('autodj_enabled',?)").run(v ? '1' : '0'),
+  getAutoDJPlaylists() { const r = db.prepare("SELECT value FROM state WHERE key='autodj_playlists'").get(); return r ? JSON.parse(r.value) : []; },
+  setAutoDJPlaylists: (ids) => db.prepare("INSERT OR REPLACE INTO state(key,value) VALUES('autodj_playlists',?)").run(JSON.stringify(ids)),
   getSetting(key)       { const r = db.prepare('SELECT value FROM state WHERE key=?').get(key); return r ? r.value : null; },
   setSetting(key, val)  { db.prepare('INSERT OR REPLACE INTO state(key,value) VALUES(?,?)').run(key, String(val)); },
   clearAll() {

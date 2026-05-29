@@ -127,6 +127,11 @@ function AdminDashboard({
   const [silenceSaving,    setSilenceSaving]    = useState(false);
   const [silenceSaved,     setSilenceSaved]     = useState(false);
   const [clearChatConfirm, setClearChatConfirm] = useState(false);
+  const [playlists,        setPlaylists]        = useState([]);
+  const [selectedPLs,      setSelectedPLs]      = useState([]);
+  const [plsSaving,        setPlsSaving]        = useState(false);
+  const [plsSaved,         setPlsSaved]         = useState(false);
+  const [plsLoading,       setPlsLoading]       = useState(false);
 
   // Cola tab
   const [clearQueueConfirm, setClearQueueConfirm] = useState(false);
@@ -149,6 +154,14 @@ function AdminDashboard({
   const [roleSaving,    setRoleSaving]   = useState(null);
 
   useEffect(() => { if (tab === 'users') loadUsers(); }, [tab]);
+  useEffect(() => {
+    if (tab !== 'control') return;
+    setPlsLoading(true);
+    authFetch('/api/autodj/playlists').then(r => r.json()).then(data => {
+      setPlaylists(data.playlists || []);
+      setSelectedPLs(data.selected || []);
+    }).catch(() => {}).finally(() => setPlsLoading(false));
+  }, [tab]);
 
   const loadUsers = async () => {
     setUsersLoading(true);
@@ -168,6 +181,12 @@ function AdminDashboard({
     setSilenceSaving(true);
     await authFetch('/api/player/silence-config', { method: 'POST', body: JSON.stringify({ threshold, seconds: silSecs }) });
     setSilenceSaving(false); setSilenceSaved(true); setTimeout(() => setSilenceSaved(false), 2000);
+  };
+  const togglePL = id => setSelectedPLs(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
+  const savePlaylists = async () => {
+    setPlsSaving(true);
+    await authFetch('/api/autodj/playlists', { method: 'POST', body: JSON.stringify({ selected: selectedPLs }) });
+    setPlsSaving(false); setPlsSaved(true); setTimeout(() => setPlsSaved(false), 2000);
   };
 
   // Cola actions
@@ -225,18 +244,47 @@ function AdminDashboard({
           </div>
 
           {/* AutoDJ */}
-          <div className="bg-gray-900/50 rounded-2xl border border-gray-800/40 p-4 flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <p className="text-sm font-semibold">AutoDJ</p>
-              <p className="text-xs text-gray-500 mt-0.5 leading-snug">
-                {autoDJEnabled ? (autoDJActive ? 'Activo — reproduciendo automáticamente' : 'Habilitado — esperando cola vacía') : 'Desactivado'}
-              </p>
+          <div className="bg-gray-900/50 rounded-2xl border border-gray-800/40 p-4 space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <p className="text-sm font-semibold">AutoDJ</p>
+                <p className="text-xs text-gray-500 mt-0.5 leading-snug">
+                  {autoDJEnabled ? (autoDJActive ? 'Activo — reproduciendo automáticamente' : 'Habilitado — esperando cola vacía') : 'Desactivado'}
+                </p>
+              </div>
+              <button onClick={toggleAutoDJ}
+                className={'flex-shrink-0 px-4 py-2 rounded-xl text-xs font-bold transition-all active:scale-95 ' +
+                  (autoDJEnabled ? 'bg-green-800/50 text-green-400 hover:bg-green-800' : 'bg-gray-800 text-gray-400 hover:bg-gray-700')}>
+                {autoDJEnabled ? 'Desactivar' : 'Activar'}
+              </button>
             </div>
-            <button onClick={toggleAutoDJ}
-              className={'flex-shrink-0 px-4 py-2 rounded-xl text-xs font-bold transition-all active:scale-95 ' +
-                (autoDJEnabled ? 'bg-green-800/50 text-green-400 hover:bg-green-800' : 'bg-gray-800 text-gray-400 hover:bg-gray-700')}>
-              {autoDJEnabled ? 'Desactivar' : 'Activar'}
-            </button>
+            {/* Playlist selector */}
+            <div className="border-t border-gray-800/60 pt-3 space-y-2">
+              <p className="text-xs text-gray-500 font-semibold uppercase tracking-widest">Listas de reproducción</p>
+              <p className="text-xs text-gray-600 leading-snug">
+                {selectedPLs.length === 0 ? 'Sin selección — se usarán canciones aleatorias' : selectedPLs.length + ' lista(s) seleccionada(s)'}
+              </p>
+              {plsLoading ? (
+                <p className="text-xs text-gray-600">Cargando...</p>
+              ) : playlists.length === 0 ? (
+                <p className="text-xs text-gray-600">No hay listas disponibles en Navidrome</p>
+              ) : (
+                <div className="space-y-1.5 max-h-48 overflow-y-auto pr-1">
+                  {playlists.map(pl => (
+                    <label key={pl.id} className="flex items-center gap-2.5 cursor-pointer group">
+                      <input type="checkbox" checked={selectedPLs.includes(pl.id)} onChange={() => togglePL(pl.id)}
+                        className="w-4 h-4 accent-red-600 rounded cursor-pointer flex-shrink-0" />
+                      <span className="text-sm text-gray-300 group-hover:text-white transition-colors truncate">{pl.name}</span>
+                      {pl.count != null && <span className="text-xs text-gray-600 flex-shrink-0">{pl.count}</span>}
+                    </label>
+                  ))}
+                </div>
+              )}
+              <button onClick={savePlaylists} disabled={plsSaving || plsLoading}
+                className="w-full py-2 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 rounded-xl text-xs font-semibold transition-colors mt-1">
+                {plsSaving ? 'Guardando...' : plsSaved ? '¡Guardado!' : 'Guardar selección'}
+              </button>
+            </div>
           </div>
 
           {/* Chat */}
