@@ -313,14 +313,21 @@ export default function PlayerView() {
         clearMediaSession();        // PV-001
       }
       setNowPlaying(song);
-      setNeedsTap(false);
       if (song) {
         const active = getActive();
         if (active && playingSrcRef.current !== newSrc) {
           playingSrcRef.current = newSrc;
           active.volume = targetVolRef.current;
           active.src = newSrc;
-          active.play().then(() => setIsPlaying(true)).catch(() => {});
+          // Resumir AudioContext antes de intentar play (puede estar suspendido en background)
+          const doPlay = () => active.play()
+            .then(() => { setIsPlaying(true); setNeedsTap(false); })
+            .catch(() => { setNeedsTap(true); }); // overlay para que el usuario toque
+          if (audioCtxRef.current?.state === 'suspended') {
+            audioCtxRef.current.resume().then(doPlay).catch(doPlay);
+          } else {
+            doPlay();
+          }
         }
       }
     });
@@ -355,21 +362,30 @@ export default function PlayerView() {
 
     const onVisibility = () => {
       if (!document.hidden) {
-        // PV-004: recuperar AudioContext al volver al primer plano
-        if (audioCtxRef.current?.state === 'suspended') {
-          audioCtxRef.current.resume().catch(() => {});
-        }
-        const active = getActive();
-        if (active?.ended) {
-          // Si el avance lleva más de 10s bloqueado (JS throttleado en background),
-          // forzar reset del mutex y reintentar. Si lleva <10s, el callback del
-          // socket debería resolverse solo en los próximos ticks.
-          const advancingSecs = (Date.now() - advancingStartRef.current) / 1000;
-          if (!advancingRef.current || advancingSecs > 10) {
-            advancingRef.current = false;
-            handleEnded(false);
+        // PV-004: recuperar AudioContext suspendido
+        const resumeCtx = audioCtxRef.current?.state === 'suspended'
+          ? audioCtxRef.current.resume().catch(() => {})
+          : Promise.resolve();
+
+        resumeCtx.then(() => {
+          const active = getActive();
+
+          if (active?.ended) {
+            // Canción terminó en background: reintentar avance
+            const advancingSecs = (Date.now() - advancingStartRef.current) / 1000;
+            if (!advancingRef.current || advancingSecs > 10) {
+              advancingRef.current = false;
+              handleEnded(false);
+            }
+
+          } else if (active?.paused && active?.src && !advancingRef.current) {
+            // play() falló en background (política autoplay): reintentar ahora
+            // que el tab está en primer plano y el AudioContext está activo.
+            active.play()
+              .then(() => { setIsPlaying(true); setNeedsTap(false); })
+              .catch(() => { setNeedsTap(true); });
           }
-        }
+        });
       }
     };
     document.addEventListener('visibilitychange', onVisibility);

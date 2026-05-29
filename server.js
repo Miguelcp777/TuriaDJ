@@ -506,8 +506,9 @@ function clearSongEndTimer() {
 
 function scheduleSongEnd(songId, durationSecs) {
   clearSongEndTimer();
-  if (!durationSecs || durationSecs <= 0) return;
-  const delay = (durationSecs + 8) * 1000;
+  // Si la canción no tiene duración en metadatos, fallback de 10 minutos
+  const safeDuration = (durationSecs && durationSecs > 0) ? durationSecs : 600;
+  const delay = (safeDuration + 8) * 1000;
   songEndTimer = setTimeout(async () => {
     songEndTimer = null;
     const current = db.getNowPlaying();
