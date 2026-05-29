@@ -38,7 +38,8 @@ export default function PlayerView() {
   const audioB = useRef(null);
   const activeRef      = useRef('A');
   const queueRef       = useRef([]);
-  const advancingRef   = useRef(false);
+  const advancingRef      = useRef(false);
+  const advancingStartRef = useRef(0);    // timestamp del inicio del avance actual
   const playingSrcRef  = useRef('');
   const targetVolRef   = useRef(1);
   const crossfadeTimer = useRef(null);
@@ -233,6 +234,7 @@ export default function PlayerView() {
   const handleEnded = (fromSkip = false) => {
     if (advancingRef.current) return;
     advancingRef.current = true;
+    advancingStartRef.current = Date.now();
     stopSilenceMonitor();
     setIsPlaying(false);
 
@@ -357,7 +359,17 @@ export default function PlayerView() {
         if (audioCtxRef.current?.state === 'suspended') {
           audioCtxRef.current.resume().catch(() => {});
         }
-        if (getActive()?.ended) handleEnded(false);
+        const active = getActive();
+        if (active?.ended) {
+          // Si el avance lleva más de 10s bloqueado (JS throttleado en background),
+          // forzar reset del mutex y reintentar. Si lleva <10s, el callback del
+          // socket debería resolverse solo en los próximos ticks.
+          const advancingSecs = (Date.now() - advancingStartRef.current) / 1000;
+          if (!advancingRef.current || advancingSecs > 10) {
+            advancingRef.current = false;
+            handleEnded(false);
+          }
+        }
       }
     };
     document.addEventListener('visibilitychange', onVisibility);

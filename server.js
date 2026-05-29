@@ -168,6 +168,7 @@ app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
 
 app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
   clearSessionTimer();
+  clearSongEndTimer();
   stopBroadcast();
   autoDJActive = false;
   db.setSessionActive(false);
@@ -308,6 +309,7 @@ app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res
 
 // ── advanceQueue: lógica de avance compartida entre HTTP y socket ─────────────
 async function advanceQueue() {
+  clearSongEndTimer(); // cancelar el timer de la canción anterior
   const queue = db.getQueue();
   if (!queue.length) {
     if (db.getAutoDJEnabled()) {
@@ -332,6 +334,7 @@ async function advanceQueue() {
         autoDJActive = true;
         broadcast();
         io.emit('autodj:update', { enabled: true, active: true });
+        scheduleSongEnd(pick.id, pick.duration || 0); // safety net
         return pick;
       } catch (e) {
         console.error('AutoDJ error:', e.message);
@@ -351,6 +354,7 @@ async function advanceQueue() {
   autoDJActive = false;
   broadcast();
   io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
+  scheduleSongEnd(next.id, next.duration || 0); // safety net
   return next;
 }
 
@@ -490,10 +494,34 @@ app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/dist/index.
 let lastProgress  = { position: 0 };
 let autoDJActive  = false;
 let sessionTimer  = null;
+let songEndTimer  = null;   // safety net: server-side auto-advance when song duration expires
+
+// ── Server-side song-end safety net ─────────────────────────────────────────
+// Fires (duration + 8s) after a song starts. If the client hasn't already
+// advanced (nowPlaying still points to the same song), the server advances.
+// This ensures AutoDJ kicks in even when the player tab is throttled/backgrounded.
+function clearSongEndTimer() {
+  if (songEndTimer) { clearTimeout(songEndTimer); songEndTimer = null; }
+}
+
+function scheduleSongEnd(songId, durationSecs) {
+  clearSongEndTimer();
+  if (!durationSecs || durationSecs <= 0) return;
+  const delay = (durationSecs + 8) * 1000;
+  songEndTimer = setTimeout(async () => {
+    songEndTimer = null;
+    const current = db.getNowPlaying();
+    if (!current || current.id !== songId) return; // client already advanced
+    if (!db.getSessionActive()) return;
+    console.log('[songEnd] auto-advance for song', songId);
+    try { await advanceQueue(); } catch (e) { console.error('[songEnd] error:', e.message); }
+  }, delay);
+}
 
 function autoEndSession() {
   sessionTimer = null;
   db.setSetting('session_end_time', '');
+  clearSongEndTimer();
   stopBroadcast();
   autoDJActive = false;
   db.setSessionActive(false);
