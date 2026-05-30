@@ -4,10 +4,10 @@ import { Music, SkipForward, Volume2, Play, Pause } from 'lucide-react';
 
 const socket = io({ transports: ['websocket'] });
 
-const CROSSFADE_MS      = 4000;
+const CROSSFADE_MS      = 4000;   // duración por defecto — configurable desde RemoteView
 const CROSSFADE_TICK    = 50;
 const SILENCE_THRESHOLD = 0.02;   // valor por defecto — puede sobreescribirse desde RemoteView
-const SILENCE_SECONDS   = 2;      // valor por defecto
+const SILENCE_SECONDS   = 1;      // segundos de silencio antes de avance inmediato
 const SILENCE_WINDOW    = 60;
 const PRELOAD_WINDOW    = 90;     // segundos antes del final donde se precarga la siguiente
 
@@ -42,8 +42,9 @@ export default function PlayerView() {
   const advancingStartRef = useRef(0);    // timestamp del inicio del avance actual
   const playingSrcRef  = useRef('');
   const targetVolRef   = useRef(1);
-  const crossfadeTimer = useRef(null);
-  const preloadedRef   = useRef('');        // PV-002: ID de canción precargada en elemento inactivo
+  const crossfadeTimer  = useRef(null);
+  const crossfadeMsRef  = useRef(CROSSFADE_MS); // duración del crossfade — configurable
+  const preloadedRef    = useRef('');            // PV-002: ID de canción precargada en elemento inactivo
   // Web Audio
   const audioCtxRef  = useRef(null);
   const analyserRef  = useRef(null);
@@ -125,7 +126,7 @@ export default function PlayerView() {
         if (!silenceStart.current) silenceStart.current = Date.now();
         else if (Date.now() - silenceStart.current >= silenceSecondsRef.current * 1000) {
           stopSilenceMonitor();
-          handleEnded(false); // fin natural → crossfade
+          handleEnded(false, true); // silencio detectado → switch inmediato
         }
       } else {
         silenceStart.current = null;
@@ -178,7 +179,7 @@ export default function PlayerView() {
       setNeedsTap(false);
       const vol = targetVolRef.current;
       let step = 0;
-      const totalSteps = CROSSFADE_MS / CROSSFADE_TICK;
+      const totalSteps = crossfadeMsRef.current / CROSSFADE_TICK;
 
       crossfadeTimer.current = setInterval(() => {
         step++;
@@ -226,12 +227,13 @@ export default function PlayerView() {
   };
 
   // ── handleEnded ──────────────────────────────────────────────────────────
-  // fromSkip = true  → switch inmediato (el DJ pulsó "siguiente")
-  // fromSkip = false → crossfade 4s  (fin natural o silencio detectado)
+  // fromSkip    = true  → switch inmediato (el DJ pulsó "siguiente")
+  // fromSilence = true  → switch inmediato (silencio detectado > 1s en la pista)
+  // ambos false         → crossfade completo (fin natural por tiempo)
   //
   // El avance automático usa socket.emit con acknowledgment para evitar
   // depender de auth HTTP — PlayerView puede estar abierto sin sesión de admin.
-  const handleEnded = (fromSkip = false) => {
+  const handleEnded = (fromSkip = false, fromSilence = false) => {
     if (advancingRef.current) return;
     advancingRef.current = true;
     advancingStartRef.current = Date.now();
@@ -249,8 +251,8 @@ export default function PlayerView() {
     const onSong = (song) => {
       clearTimeout(guard);
       if (song) {
-        if (fromSkip) { resetPreload(); doImmediateSwitch(song); }
-        else            doCrossfade(song);
+        if (fromSkip || fromSilence) { resetPreload(); doImmediateSwitch(song); }
+        else                           doCrossfade(song);
       } else {
         clearMediaSession();
         setNowPlaying(null);
@@ -337,6 +339,10 @@ export default function PlayerView() {
       if (seconds   !== undefined) silenceSecondsRef.current   = seconds;
     });
 
+    socket.on('player:crossfade-config', ({ ms }) => {
+      if (ms && ms > 0) crossfadeMsRef.current = ms;
+    });
+
     socket.on('player:cmd', ({ action, value }) => {
       const active = getActive();
       if (action === 'play' && active) {
@@ -409,6 +415,7 @@ export default function PlayerView() {
       socket.off('player:update');
       socket.off('player:cmd');
       socket.off('player:silence-config');
+      socket.off('player:crossfade-config');
       document.removeEventListener('visibilitychange', onVisibility);
       stopSilenceMonitor();
       stopCrossfade();
@@ -446,10 +453,11 @@ export default function PlayerView() {
         if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume().catch(() => {});
         startSilenceMonitor();
       }
-      // Crossfade anticipado: disparar 5s antes del final si no hay avance en curso.
-      // Garantiza solapamiento real (ambas canciones suenan juntas) en lugar de
-      // fade-in desde silencio cuando la canción no tiene fade-out natural.
-      if (remaining <= 5 && remaining > 0 && !advancingRef.current && !crossfadeTimer.current) {
+      // Crossfade anticipado: disparar (crossfadeMs/1000 + 1)s antes del final.
+      // Garantiza solapamiento real (ambas canciones suenan juntas) durante el
+      // periodo configurado, en lugar de fade-in desde silencio post-canción.
+      const preTrigger = Math.ceil(crossfadeMsRef.current / 1000) + 1;
+      if (remaining <= preTrigger && remaining > 0 && !advancingRef.current && !crossfadeTimer.current) {
         handleEnded(false);
       }
     }

@@ -69,7 +69,8 @@ export default function RemoteView() {
   const [progress, setProgress]       = useState({ position: 0, duration: 0 });
   const [volume, setVolume]           = useState(100);
   const [silenceThreshold, setSilenceThreshold] = useState(0.02);
-  const [silenceSeconds, setSilenceSeconds]     = useState(2);
+  const [silenceSeconds, setSilenceSeconds]     = useState(1);
+  const [crossfadeSecs, setCrossfadeSecs]       = useState(4);
   const [showSilence, setShowSilence]           = useState(false);
   const skipBusy = useRef(false);
 
@@ -93,11 +94,19 @@ export default function RemoteView() {
     socket.on('queue:update',   setQueue);
     socket.on('player:progress', p => setProgress(p || { position: 0, duration: 0 }));
     socket.on('player:state',   ({ playing }) => setIsPlaying(playing));
+    socket.on('player:silence-config', ({ threshold, seconds }) => {
+      if (threshold !== undefined) setSilenceThreshold(threshold);
+      if (seconds   !== undefined) setSilenceSeconds(seconds);
+    });
+    socket.on('player:crossfade-config', ({ ms }) => {
+      if (ms && ms > 0) setCrossfadeSecs(ms / 1000);
+    });
     fetch('/api/now-playing').then(r => r.json()).then(s => { if (s) setNowPlaying(s); });
     fetch('/api/queue').then(r => r.json()).then(setQueue);
     return () => {
       socket.off('player:update'); socket.off('queue:update');
       socket.off('player:progress'); socket.off('player:state');
+      socket.off('player:silence-config'); socket.off('player:crossfade-config');
     };
   }, [user]);
 
@@ -140,6 +149,14 @@ export default function RemoteView() {
   const handleSilenceSeconds = v => {
     setSilenceSeconds(v);
     cmd('silence-seconds', v);
+  };
+
+  const handleCrossfadeSecs = v => {
+    setCrossfadeSecs(v);
+    authFetch('/api/player/crossfade-config', {
+      method: 'POST',
+      body: JSON.stringify({ ms: v * 1000 }),
+    }).catch(() => {});
   };
 
   const handleAuth = (token, u) => { setAuthToken(token); setUser(u); };
@@ -230,19 +247,35 @@ export default function RemoteView() {
         </div>
       </div>
 
-      {/* Silence config — PV-003 */}
+      {/* Crossfade + Silence config */}
       <div className="mb-6">
         <button
           onClick={() => setShowSilence(v => !v)}
           className="flex items-center gap-2 text-gray-500 hover:text-gray-300 transition-colors w-full"
         >
           <SlidersHorizontal size={14} />
-          <span className="text-xs font-semibold uppercase tracking-widest">Detección de silencio</span>
+          <span className="text-xs font-semibold uppercase tracking-widest">Crossfade y silencio</span>
           {showSilence ? <ChevronUp size={14} className="ml-auto" /> : <ChevronDown size={14} className="ml-auto" />}
         </button>
 
         {showSilence && (
           <div className="mt-3 space-y-4 bg-gray-900/50 rounded-xl p-4 border border-gray-800/40">
+            <div>
+              <div className="flex justify-between text-xs text-gray-500 mb-2">
+                <span>Duración del crossfade</span>
+                <span className="text-gray-300 font-mono">{crossfadeSecs.toFixed(0)} s</span>
+              </div>
+              <input
+                type="range" min={1} max={10} step={1}
+                value={crossfadeSecs}
+                onChange={e => handleCrossfadeSecs(Number(e.target.value))}
+                className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer"
+              />
+              <div className="flex justify-between text-xs text-gray-700 mt-1">
+                <span>corto</span><span>largo</span>
+              </div>
+            </div>
+
             <div>
               <div className="flex justify-between text-xs text-gray-500 mb-2">
                 <span>Umbral de silencio</span>
@@ -261,7 +294,7 @@ export default function RemoteView() {
 
             <div>
               <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Segundos de silencio</span>
+                <span>Segundos antes de avance por silencio</span>
                 <span className="text-gray-300 font-mono">{silenceSeconds.toFixed(1)} s</span>
               </div>
               <input

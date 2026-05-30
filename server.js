@@ -299,10 +299,18 @@ app.post('/api/player/silence-config', auth.adminMiddleware, (req, res) => {
   if (seconds   !== undefined) db.setSetting('silence_seconds',   seconds);
   const data = {
     threshold: parseFloat(db.getSetting('silence_threshold') || 0.02),
-    seconds:   parseFloat(db.getSetting('silence_seconds')   || 2),
+    seconds:   parseFloat(db.getSetting('silence_seconds')   || 1),
   };
   io.emit('player:silence-config', data);
   res.json({ success: true, ...data });
+});
+
+app.post('/api/player/crossfade-config', auth.adminMiddleware, (req, res) => {
+  const { ms } = req.body;
+  if (ms !== undefined && ms > 0) db.setSetting('crossfade_ms', ms);
+  const crossfadeMs = parseInt(db.getSetting('crossfade_ms') || 4000, 10);
+  io.emit('player:crossfade-config', { ms: crossfadeMs });
+  res.json({ success: true, ms: crossfadeMs });
 });
 
 app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res.json(song ? { ...song, position: lastProgress.position } : null); });
@@ -611,7 +619,12 @@ io.on('connection', socket => {
   // Silence config: send persisted values to new connection
   socket.emit('player:silence-config', {
     threshold: parseFloat(db.getSetting('silence_threshold') || 0.02),
-    seconds:   parseFloat(db.getSetting('silence_seconds')   || 2),
+    seconds:   parseFloat(db.getSetting('silence_seconds')   || 1),
+  });
+
+  // Crossfade config: send persisted value to new connection
+  socket.emit('player:crossfade-config', {
+    ms: parseInt(db.getSetting('crossfade_ms') || 4000, 10),
   });
 
   // Chat: send history to new connection
