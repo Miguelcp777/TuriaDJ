@@ -446,6 +446,12 @@ export default function PlayerView() {
         if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume().catch(() => {});
         startSilenceMonitor();
       }
+      // Crossfade anticipado: disparar 5s antes del final si no hay avance en curso.
+      // Garantiza solapamiento real (ambas canciones suenan juntas) en lugar de
+      // fade-in desde silencio cuando la canción no tiene fade-out natural.
+      if (remaining <= 5 && remaining > 0 && !advancingRef.current && !crossfadeTimer.current) {
+        handleEnded(false);
+      }
     }
   };
 

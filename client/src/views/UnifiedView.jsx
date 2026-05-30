@@ -990,32 +990,19 @@ export default function UnifiedView() {
     setVoterLoading(false);
   };
 
-  // crossfade: immediately start incoming audio at vol 0, ramp both over 4 s
-  // Synchronous so RAF begins before any network delay
-  const triggerCrossfade = (nextQueue) => {
-    if (!nextQueue || nextQueue.length === 0) { fadeScheduled.current = false; return; }
-    const nextSong = nextQueue[0]; // use queue already in state
-
+  // Arranca el crossfade de 4s con una canción ya conocida
+  const startCrossfade = (song) => {
     const out = getActive();
     const inn = getInactive();
     if (!out || !inn) { fadeScheduled.current = false; return; }
-
-    // Load and start incoming at volume 0 immediately
     inn.volume = 0;
-    inn.src = '/api/stream/' + nextSong.id;
+    inn.src = '/api/stream/' + song.id;
     inn.load();
     inn.play().catch(() => {});
-
-    // Advance queue on server (fire-and-forget, no await)
-    authFetch('/api/player/next', { method: 'POST' })
-      .then(r => r.json())
-      .then(({ song }) => { if (song) setNowPlaying(song); })
-      .catch(() => {});
-
+    setNowPlaying(song);
     const startVol = out.volume > 0 ? out.volume : 1;
     const t0 = performance.now();
     cancelAnimationFrame(crossfadeRaf.current);
-
     const tick = (now) => {
       const p = Math.min((now - t0) / 4000, 1);
       if (out) out.volume = startVol * (1 - p);
@@ -1031,6 +1018,14 @@ export default function UnifiedView() {
     crossfadeRaf.current = requestAnimationFrame(tick);
   };
 
+  // Crossfade con canción de la cola (la canción ya se conoce → audio arranca sin esperar servidor)
+  const triggerCrossfade = (nextQueue) => {
+    if (!nextQueue || nextQueue.length === 0) { fadeScheduled.current = false; return; }
+    startCrossfade(nextQueue[0]);
+    // Avanzar cola en servidor (fire-and-forget)
+    authFetch('/api/player/next', { method: 'POST' }).catch(() => {});
+  };
+
   // ── audio event handlers ───────────────────────────────────────────────────
   const handleTimeUpdate = (which) => {
     if (which !== activeRef.current) return;
@@ -1041,10 +1036,20 @@ export default function UnifiedView() {
     setCurrentTime(ct);
     setDuration(dur);
     socket.emit('player:progress', { position: ct, duration: dur });
-    // Trigger crossfade 4 s before end (admin only, queue must have next song)
-    if (isAdmin && dur > 4 && dur - ct <= 4 && !fadeScheduled.current && queue.length > 0) {
+    // Crossfade 5s antes del final (admin). Funciona con cola Y con AutoDJ.
+    if (isAdmin && dur > 5 && dur - ct <= 5 && !fadeScheduled.current) {
       fadeScheduled.current = true;
-      triggerCrossfade(queue);
+      if (queue.length > 0) {
+        triggerCrossfade(queue);
+      } else if (autoDJEnabled) {
+        // AutoDJ: pedir la siguiente canción al servidor y arrancar crossfade
+        authFetch('/api/player/next', { method: 'POST' })
+          .then(r => r.json())
+          .then(({ song }) => { if (song) startCrossfade(song); else fadeScheduled.current = false; })
+          .catch(() => { fadeScheduled.current = false; });
+      } else {
+        fadeScheduled.current = false;
+      }
     }
   };
 
