@@ -118,14 +118,15 @@ function AdminDashboard({
   currentUser, authToken, authFetch, queue,
   sessionActive, sessionName: initName, sessionDesc: initDesc,
   autoDJEnabled, autoDJActive, chatEnabled,
-  silenceConfig, sessionEndTime, onClose, onStopAudio, initialTab
+  silenceConfig, crossfadeConfig, sessionEndTime, onClose, onStopAudio, initialTab
 }) {
   const [tab, setTab] = useState(initialTab || 'control');
 
   // Control tab
   const [volume,           setVolume]          = useState(100);
   const [threshold,        setThreshold]        = useState(silenceConfig?.threshold ?? 0.02);
-  const [silSecs,          setSilSecs]          = useState(silenceConfig?.seconds ?? 2);
+  const [silSecs,          setSilSecs]          = useState(silenceConfig?.seconds ?? 1);
+  const [crossfadeSecs,    setCrossfadeSecs]    = useState((crossfadeConfig?.ms ?? 4000) / 1000);
   const [silenceSaving,    setSilenceSaving]    = useState(false);
   const [silenceSaved,     setSilenceSaved]     = useState(false);
   const [clearChatConfirm, setClearChatConfirm] = useState(false);
@@ -190,6 +191,9 @@ function AdminDashboard({
     setSilenceSaving(true);
     await authFetch('/api/player/silence-config', { method: 'POST', body: JSON.stringify({ threshold, seconds: silSecs }) });
     setSilenceSaving(false); setSilenceSaved(true); setTimeout(() => setSilenceSaved(false), 2000);
+  };
+  const saveCrossfade = async (secs) => {
+    await authFetch('/api/player/crossfade-config', { method: 'POST', body: JSON.stringify({ ms: secs * 1000 }) });
   };
   const togglePL = id => setSelectedPLs(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
   const savePlaylists = async () => {
@@ -377,12 +381,30 @@ function AdminDashboard({
             </div>
           </div>
 
-          {/* Silence config */}
+          {/* Crossfade + Silence config */}
           <div className="bg-gray-900/50 rounded-2xl border border-gray-800/40 p-4 space-y-4">
-            <p className="text-xs text-gray-500 font-semibold uppercase tracking-widest">Detección de silencio</p>
+            <p className="text-xs text-gray-500 font-semibold uppercase tracking-widest">Crossfade y silencio</p>
+
+            {/* Crossfade duration */}
             <div>
               <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Umbral de amplitud</span>
+                <span>Duración del crossfade</span>
+                <span className="font-mono text-gray-300">{crossfadeSecs} s</span>
+              </div>
+              <input type="range" min={1} max={10} step={1} value={crossfadeSecs}
+                onChange={e => setCrossfadeSecs(Number(e.target.value))}
+                onMouseUp={e => saveCrossfade(Number(e.target.value))}
+                onTouchEnd={e => saveCrossfade(Number(e.target.value))}
+                className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer" />
+              <div className="flex justify-between text-xs text-gray-700 mt-1"><span>1 s</span><span>10 s</span></div>
+            </div>
+
+            <div className="border-t border-gray-800/50" />
+
+            {/* Silence threshold */}
+            <div>
+              <div className="flex justify-between text-xs text-gray-500 mb-2">
+                <span>Umbral de amplitud (silencio)</span>
                 <span className="font-mono text-gray-300">{threshold.toFixed(3)}</span>
               </div>
               <input type="range" min={0.005} max={0.08} step={0.005} value={threshold} onChange={e => setThreshold(Number(e.target.value))}
@@ -391,7 +413,7 @@ function AdminDashboard({
             </div>
             <div>
               <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Segundos de silencio</span>
+                <span>Segundos de silencio antes de avanzar</span>
                 <span className="font-mono text-gray-300">{silSecs.toFixed(1)} s</span>
               </div>
               <input type="range" min={0.5} max={5} step={0.5} value={silSecs} onChange={e => setSilSecs(Number(e.target.value))}
@@ -400,7 +422,7 @@ function AdminDashboard({
             </div>
             <button onClick={saveSilence} disabled={silenceSaving}
               className="w-full py-2.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 rounded-xl text-sm font-semibold transition-colors">
-              {silenceSaving ? 'Guardando...' : silenceSaved ? '¡Guardado!' : 'Guardar configuración'}
+              {silenceSaving ? 'Guardando...' : silenceSaved ? '¡Guardado!' : 'Guardar config de silencio'}
             </button>
           </div>
         </div>
@@ -826,7 +848,8 @@ export default function UnifiedView() {
   const [autoDJActive,  setAutoDJActive]  = useState(false);
   const [onlineUsers,   setOnlineUsers]   = useState({ count: 0, users: [] });
   const [showOnlinePanel, setShowOnlinePanel] = useState(false);
-  const [silenceConfig, setSilenceConfig] = useState({ threshold: 0.02, seconds: 2 });
+  const [silenceConfig,   setSilenceConfig]   = useState({ threshold: 0.02, seconds: 1 });
+  const [crossfadeConfig, setCrossfadeConfig] = useState({ ms: 4000 });
   const [chatMessages,  setChatMessages]  = useState([]);
   const [chatEnabled,   setChatEnabled]   = useState(true);
   const [chatOpen,      setChatOpen]      = useState(false);
@@ -878,6 +901,7 @@ export default function UnifiedView() {
     fetch('/api/autodj/status').then(r => r.json()).then(({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); }).catch(() => {});
     socket.on('users:online', (data) => setOnlineUsers(data));
     socket.on('player:silence-config', ({ threshold, seconds }) => setSilenceConfig({ threshold, seconds }));
+    socket.on('player:crossfade-config', ({ ms }) => { if (ms > 0) setCrossfadeConfig({ ms }); });
     socket.on('chat:history', ({ messages, enabled }) => { setChatMessages(messages); setChatEnabled(enabled); });
     socket.on('chat:message', msg => {
       setChatMessages(prev => [...prev, msg]);
@@ -1384,7 +1408,7 @@ export default function UnifiedView() {
           currentUser={currentUser} authToken={authToken} authFetch={authFetch}
           queue={queue} sessionActive={sessionActive} sessionName={sessionName} sessionDesc={sessionDesc}
           autoDJEnabled={autoDJEnabled} autoDJActive={autoDJActive} chatEnabled={chatEnabled}
-          silenceConfig={silenceConfig} sessionEndTime={sessionEndTime}
+          silenceConfig={silenceConfig} crossfadeConfig={crossfadeConfig} sessionEndTime={sessionEndTime}
           onClose={() => setAdminOpen(false)} onStopAudio={stopAudio}
           initialTab={adminTab}
         />
