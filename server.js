@@ -4,6 +4,7 @@ const http     = require('http');
 const { Server } = require('socket.io');
 const path     = require('path');
 const axios    = require('axios');
+const { spawn } = require('child_process');
 const db       = require('./db');
 const nd       = require('./navidrome');
 const auth     = require('./auth');
@@ -27,6 +28,9 @@ let bcastJoinBufMax = 0;
 let bcastBPS        = 16000; // bytes/sec, recalculated per song
 let bcastTicker     = null;
 let bcastUpstream   = null;
+let bcastFFmpeg     = null;            // child_process si estamos en modo crossfade
+let bcastCurrentId  = null;            // id de la canción actual
+let bcastStartTime  = 0;               // Date.now() cuando empezó la actual
 
 function bcastTick() {
   if (bcastQueue.length === 0) return;
@@ -44,15 +48,89 @@ function bcastTick() {
   dead.forEach(r => bcastClients.delete(r));
 }
 
-function startBroadcast(songId, duration) {
-  // Keep existing voter connections alive, just swap source
-  if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
+function _cleanupUpstream() {
   if (bcastUpstream) { try { bcastUpstream.destroy(); } catch(e) {} bcastUpstream = null; }
-  bcastQueue = Buffer.alloc(0); bcastJoinBuf = Buffer.alloc(0);
-  const url = nd.streamUrl(songId);
+  if (bcastFFmpeg)   { try { bcastFFmpeg.kill('SIGKILL'); } catch(e) {} bcastFFmpeg = null; }
+}
+
+// Inicia un broadcast con crossfade real del servidor (mezcla con ffmpeg).
+// Si prevSongId está definido y prevElapsed > 0, mezcla los últimos N segundos
+// de la canción anterior (desde el punto actual aproximado) con los primeros
+// segundos de la nueva, aplicando acrossfade. El resultado se envía al broadcast.
+function startBroadcast(songId, duration) {
+  if (bcastTicker) { clearInterval(bcastTicker); bcastTicker = null; }
+  _cleanupUpstream();
+
+  const crossfadeMs   = parseInt(db.getSetting('crossfade_ms') || 4000, 10);
+  const crossfadeSecs = Math.max(0, Math.min(20, crossfadeMs / 1000));
+  const prevId        = bcastCurrentId;
+  const prevElapsed   = prevId && bcastStartTime ? (Date.now() - bcastStartTime) / 1000 : 0;
+
+  bcastCurrentId = songId;
+  bcastStartTime = Date.now();
+
+  // Si hay canción anterior y aún tenemos byteQueue, descartar el resto
+  // pendiente — ffmpeg incluirá esos segundos finales con fadeout.
+  bcastQueue   = Buffer.alloc(0);
+  bcastJoinBuf = Buffer.alloc(0);
+
+  const nextUrl = nd.streamUrl(songId);
+
+  // ── Caso 1: con crossfade real (ffmpeg acrossfade) ─────────────────────────
+  if (prevId && prevElapsed > 0 && crossfadeSecs > 0 && prevId !== songId) {
+    const prevUrl = nd.streamUrl(prevId);
+    // ffmpeg toma la canción previa desde 'prevElapsed' (donde estaba sonando)
+    // y la mezcla con la nueva desde 0, con acrossfade de N segundos.
+    const args = [
+      '-loglevel', 'warning',
+      '-ss', String(prevElapsed.toFixed(2)),
+      '-i', prevUrl,
+      '-i', nextUrl,
+      '-filter_complex', `[0:a][1:a]acrossfade=d=${crossfadeSecs}:c1=tri:c2=tri`,
+      '-f', 'mp3',
+      '-b:a', '192k',
+      '-'
+    ];
+    let proc;
+    try { proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] }); }
+    catch (e) {
+      console.error('spawn ffmpeg failed:', e.message);
+      return _fallbackDirectStream(nextUrl, duration);
+    }
+    bcastFFmpeg = proc;
+    // Calibrar BPS a 192 kbps (lo que emite ffmpeg)
+    bcastBPS = 192000 / 8;
+    bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS);
+    bcastUpstream = proc.stdout;
+
+    let stderrBuf = '';
+    proc.stderr.on('data', d => {
+      stderrBuf += d.toString();
+      if (stderrBuf.length > 2000) stderrBuf = stderrBuf.slice(-1500);
+    });
+    proc.stdout.on('data', chunk => { bcastQueue = Buffer.concat([bcastQueue, chunk]); });
+    proc.stdout.on('end',  () => { bcastUpstream = null; bcastFFmpeg = null; });
+    proc.on('error', err => {
+      console.error('ffmpeg error:', err.message);
+      _fallbackDirectStream(nextUrl, duration);
+    });
+    proc.on('exit', code => {
+      if (code !== 0 && code !== null) {
+        console.error('ffmpeg exited code', code, '— stderr:', stderrBuf.slice(-500));
+      }
+    });
+    bcastTicker = setInterval(bcastTick, TICK_MS);
+    console.log('broadcast crossfade', crossfadeSecs, 's:', prevId, '→', songId);
+    return;
+  }
+
+  // ── Caso 2: sin canción previa o sin crossfade — stream directo ────────────
+  _fallbackDirectStream(nextUrl, duration);
+}
+
+function _fallbackDirectStream(url, duration) {
   axios.get(url, { responseType: 'stream', timeout: 0 })
     .then(upstream => {
-      // Use content-length / duration for exact bytes-per-second
       const fileSize = parseInt(upstream.headers['content-length'] || '0');
       if (fileSize > 0 && duration > 0) {
         bcastBPS = fileSize / duration;
@@ -66,15 +144,16 @@ function startBroadcast(songId, duration) {
       upstream.data.on('data', chunk => { bcastQueue = Buffer.concat([bcastQueue, chunk]); });
       upstream.data.on('end',  () => { bcastUpstream = null; });
       upstream.data.on('error', () => { bcastUpstream = null; });
-      bcastTicker = setInterval(bcastTick, TICK_MS);
+      if (!bcastTicker) bcastTicker = setInterval(bcastTick, TICK_MS);
     })
     .catch(err => console.error('broadcast start error:', err.message));
 }
 
 function stopBroadcast() {
   if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
-  if (bcastUpstream) { try { bcastUpstream.destroy(); } catch (e) {} bcastUpstream = null; }
+  _cleanupUpstream();
   bcastQueue = Buffer.alloc(0); bcastJoinBuf = Buffer.alloc(0);
+  bcastCurrentId = null; bcastStartTime = 0;
   bcastClients.forEach(res => { try { res.end(); } catch (e) {} });
   bcastClients.clear();
 }

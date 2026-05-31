@@ -1038,32 +1038,58 @@ export default function UnifiedView() {
     setVoterLoading(false);
   };
 
-  // Arranca el crossfade de 4s con una canción ya conocida
+  // Arranca el crossfade con una canción ya conocida.
+  // Espera al evento canplay antes de empezar el fade — si no, los primeros
+  // segundos del crossfade pueden ser silencio mientras el navegador buferea.
   const startCrossfade = (song) => {
     const out = getActive();
     const inn = getInactive();
     if (!out || !inn) { fadeScheduled.current = false; return; }
+    const fadeMs = crossfadeConfig.ms || 4000;
     inn.volume = 0;
     inn.src = '/api/stream/' + song.id;
     inn.load();
-    inn.play().catch(() => {});
     setNowPlaying(song);
     const startVol = out.volume > 0 ? out.volume : 1;
-    const t0 = performance.now();
-    cancelAnimationFrame(crossfadeRaf.current);
-    const tick = (now) => {
-      const p = Math.min((now - t0) / 4000, 1);
-      if (out) out.volume = startVol * (1 - p);
-      if (inn) inn.volume = p;
-      if (p < 1) {
-        crossfadeRaf.current = requestAnimationFrame(tick);
-      } else {
-        if (out) { out.pause(); out.src = ''; out.volume = 1; }
+
+    const beginFade = () => {
+      const t0 = performance.now();
+      cancelAnimationFrame(crossfadeRaf.current);
+      const tick = (now) => {
+        const p = Math.min((now - t0) / fadeMs, 1);
+        if (out) out.volume = startVol * (1 - p);
+        if (inn) inn.volume = p * startVol;
+        if (p < 1) {
+          crossfadeRaf.current = requestAnimationFrame(tick);
+        } else {
+          if (out) { out.pause(); out.src = ''; out.volume = startVol; }
+          activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
+          fadeScheduled.current = false;
+        }
+      };
+      crossfadeRaf.current = requestAnimationFrame(tick);
+    };
+
+    // Esperar a que el nuevo audio esté listo para reproducir
+    const onCanPlay = () => {
+      inn.removeEventListener('canplay', onCanPlay);
+      inn.play().then(beginFade).catch(() => {
+        // Si play falla (autoplay policy), hacer cambio brusco
+        if (out) { out.pause(); out.src = ''; out.volume = startVol; }
         activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
         fadeScheduled.current = false;
-      }
+      });
     };
-    crossfadeRaf.current = requestAnimationFrame(tick);
+    if (inn.readyState >= 3) onCanPlay();
+    else inn.addEventListener('canplay', onCanPlay, { once: true });
+
+    // Fallback si canplay no llega en 2s: empezar igualmente
+    setTimeout(() => {
+      if (fadeScheduled.current && inn.readyState < 3) {
+        inn.removeEventListener('canplay', onCanPlay);
+        inn.play().then(beginFade).catch(() => { fadeScheduled.current = false; });
+      }
+    }, 2000);
   };
 
   // Crossfade con canción de la cola (la canción ya se conoce → audio arranca sin esperar servidor)
@@ -1084,8 +1110,11 @@ export default function UnifiedView() {
     setCurrentTime(ct);
     setDuration(dur);
     socket.emit('player:progress', { position: ct, duration: dur });
-    // Crossfade 5s antes del final (admin). Funciona con cola Y con AutoDJ.
-    if (isAdmin && dur > 5 && dur - ct <= 5 && !fadeScheduled.current) {
+    // Crossfade anticipado (admin). Dispara crossfadeSecs+1 segundos antes
+    // del final para garantizar solapamiento real. Funciona con cola Y AutoDJ.
+    const crossfadeSecs = (crossfadeConfig.ms || 4000) / 1000;
+    const preTrigger    = crossfadeSecs + 1;
+    if (isAdmin && dur > preTrigger && dur - ct <= preTrigger && !fadeScheduled.current) {
       fadeScheduled.current = true;
       if (queue.length > 0) {
         triggerCrossfade(queue);

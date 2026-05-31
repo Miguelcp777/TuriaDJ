@@ -168,12 +168,13 @@ export default function PlayerView() {
     // PV-002: si la canción coincide con la precargada, el buffer ya tiene datos
     if (preloadedRef.current !== song.id) {
       next.src = newSrc;
+      next.load();
     }
     preloadedRef.current = '';
     next.volume = 0;
 
-    next.play().then(() => {
-      updateMediaSession(song);   // PV-001
+    const beginFade = () => {
+      updateMediaSession(song);
       setNowPlaying(song);
       setIsPlaying(true);
       setNeedsTap(false);
@@ -186,7 +187,6 @@ export default function PlayerView() {
         const t = Math.min(1, step / totalSteps);
         current.volume = (1 - t) * vol;
         next.volume    = t * vol;
-
         if (step >= totalSteps) {
           stopCrossfade();
           activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
@@ -196,18 +196,34 @@ export default function PlayerView() {
           advancingRef.current = false;
         }
       }, CROSSFADE_TICK);
+    };
 
-    }).catch(() => {
-      // next.play() bloqueado por política de autoplay del navegador.
-      // Limpiar el inactive y hacer switch en el elemento activo para que
-      // togglePlay() funcione cuando el usuario toque la pantalla.
-      next.src = '';
-      next.volume = targetVolRef.current;
-      preloadedRef.current = '';
-      stopCrossfade();
-      // Redirigir al switch inmediato en el elemento activo
-      doImmediateSwitch(song);
-    });
+    const startPlay = () => {
+      next.play().then(beginFade).catch(() => {
+        next.src = '';
+        next.volume = targetVolRef.current;
+        preloadedRef.current = '';
+        stopCrossfade();
+        doImmediateSwitch(song);
+      });
+    };
+
+    // Esperar a que esté listo para reproducir (HAVE_FUTURE_DATA = 3).
+    // Si no esperamos, los primeros segundos del crossfade pueden ser silencio
+    // mientras el navegador buferea la nueva canción.
+    if (next.readyState >= 3) {
+      startPlay();
+    } else {
+      const onCanPlay = () => { next.removeEventListener('canplay', onCanPlay); startPlay(); };
+      next.addEventListener('canplay', onCanPlay, { once: true });
+      // Fallback a 1.5s — empezar igual aunque el buffer no esté completo
+      setTimeout(() => {
+        if (advancingRef.current && !crossfadeTimer.current) {
+          next.removeEventListener('canplay', onCanPlay);
+          startPlay();
+        }
+      }, 1500);
+    }
   };
 
   // ── Switch inmediato (skip / song ya terminada) ──────────────────────────
