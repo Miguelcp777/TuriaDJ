@@ -1053,18 +1053,26 @@ export default function UnifiedView() {
     const startVol = out.volume > 0 ? out.volume : 1;
 
     const beginFade = () => {
+      console.log(`[crossfade] START ${fadeMs}ms → "${song.title}"`);
       const t0 = performance.now();
       cancelAnimationFrame(crossfadeRaf.current);
+      let lastLogP = -1;
       const tick = (now) => {
         const p = Math.min((now - t0) / fadeMs, 1);
         if (out) out.volume = startVol * (1 - p);
         if (inn) inn.volume = p * startVol;
+        // Log every 25% progress
+        if (p - lastLogP >= 0.25 || p === 1) {
+          lastLogP = p;
+          console.log(`[crossfade] p=${p.toFixed(2)}  out=${(out?.volume ?? 0).toFixed(2)}  in=${(inn?.volume ?? 0).toFixed(2)}`);
+        }
         if (p < 1) {
           crossfadeRaf.current = requestAnimationFrame(tick);
         } else {
           if (out) { out.pause(); out.src = ''; out.volume = startVol; }
           activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
           fadeScheduled.current = false;
+          console.log(`[crossfade] DONE → active=${activeRef.current}`);
         }
       };
       crossfadeRaf.current = requestAnimationFrame(tick);
@@ -1115,6 +1123,7 @@ export default function UnifiedView() {
     const crossfadeSecs = (crossfadeConfig.ms || 4000) / 1000;
     const preTrigger    = crossfadeSecs + 1;
     if (isAdmin && dur > preTrigger && dur - ct <= preTrigger && !fadeScheduled.current) {
+      console.log(`[crossfade] pre-trigger at ${(dur-ct).toFixed(2)}s remaining (preTrigger=${preTrigger}s, queue=${queue.length}, autoDJ=${autoDJEnabled})`);
       fadeScheduled.current = true;
       if (queue.length > 0) {
         triggerCrossfade(queue);

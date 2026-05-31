@@ -181,12 +181,17 @@ export default function PlayerView() {
       const vol = targetVolRef.current;
       let step = 0;
       const totalSteps = crossfadeMsRef.current / CROSSFADE_TICK;
+      console.log(`[crossfade] START ${crossfadeMsRef.current}ms (${totalSteps} steps) → "${song.title}"`);
 
       crossfadeTimer.current = setInterval(() => {
         step++;
         const t = Math.min(1, step / totalSteps);
         current.volume = (1 - t) * vol;
         next.volume    = t * vol;
+        // Log every ~500ms (10 ticks)
+        if (step % 10 === 0 || step === totalSteps) {
+          console.log(`[crossfade] step ${step}/${totalSteps}  out=${current.volume.toFixed(2)}  in=${next.volume.toFixed(2)}`);
+        }
         if (step >= totalSteps) {
           stopCrossfade();
           activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
@@ -194,6 +199,7 @@ export default function PlayerView() {
           current.src    = '';
           current.volume = vol;
           advancingRef.current = false;
+          console.log(`[crossfade] DONE → active is now ${activeRef.current}`);
         }
       }, CROSSFADE_TICK);
     };
@@ -474,6 +480,7 @@ export default function PlayerView() {
       // periodo configurado, en lugar de fade-in desde silencio post-canción.
       const preTrigger = Math.ceil(crossfadeMsRef.current / 1000) + 1;
       if (remaining <= preTrigger && remaining > 0 && !advancingRef.current && !crossfadeTimer.current) {
+        console.log(`[crossfade] pre-trigger at ${remaining.toFixed(2)}s remaining (preTrigger=${preTrigger}s)`);
         handleEnded(false);
       }
     }
