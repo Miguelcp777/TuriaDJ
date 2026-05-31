@@ -79,6 +79,13 @@ function stopBroadcast() {
   bcastClients.clear();
 }
 
+// index.html nunca debe quedar cacheado (los assets JS/CSS tienen hash en el nombre)
+app.use((req, res, next) => {
+  if (req.path === '/' || req.path === '/index.html') {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+  }
+  next();
+});
 app.use(express.static(path.join(__dirname, 'client/dist')));
 
 // Seed admin on first run
