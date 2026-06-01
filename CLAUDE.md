@@ -289,6 +289,79 @@ Y en `onVisibility`, si `getActive()?.paused === false` (está "playing" según 
 - **Subsonic API** envía `p=password` en URL — aparece en logs de Navidrome (ver F-0014)
 - **`bcastJoinBufMax = 0`** en inicio — los clientes que conectan antes del primer `startBroadcast` no reciben join buffer; esto es correcto pero puede sonar a silencio breve
 - **SQLite es síncrono** — todas las operaciones de `db.js` bloquean el event loop de Node. Para cargas altas, considerar WAL mode: `db.pragma('journal_mode = WAL')`
+- **Servicio systemd en producción**: el servicio se llama `turiadj.service` (NO `jukevote.service` — ese era un duplicado antiguo que se ha eliminado). Cwd: `/opt/jukevote`. `Restart=always` con `RestartSec=5`. Para reiniciar tras deploy: `sudo systemctl restart turiadj.service`.
+- **Crossfade del servidor para voters (`/api/live`)**: NO está implementado. Se intentó con ffmpeg `acrossfade` pero rompía el bitstream MP3 del decoder del cliente (`mp3float: Header missing`) y ffmpeg tardaba ~5s en arrancar. Los voters escuchan un corte abrupto entre canciones — limitación arquitectónica conocida. El crossfade solo funciona en cliente con dual `<audio>` (PlayerView y UnifiedView admin).
+
+---
+
+## Crossfade (✅ VERIFICADO funcionando 2026-06-01)
+
+El crossfade de N segundos (configurable 1–10s, default 4s) está verificado con test E2E en Chromium headless. Funciona en:
+
+- **PlayerView** (`/player`, reproductor físico) — dual audio A/B + `setInterval` ticks
+- **UnifiedView** (panel admin) — dual audio A/B + `requestAnimationFrame`
+
+**NO funciona en:** modo voter (escucha `/api/live`) — el broadcast del servidor cambia abruptamente.
+
+### Configuración
+
+Persiste en `db.state.crossfade_ms` (default 4000). Editable desde:
+- `RemoteView` → slider "Duración del crossfade"
+- `UnifiedView` panel admin → pestaña Control → bloque "Crossfade y silencio"
+- `POST /api/player/crossfade-config` con `{ ms: number }` (admin)
+
+Cambios se propagan vía `player:crossfade-config` socket event a todos los clientes.
+
+### Cuándo se dispara
+
+| Evento | Acción |
+|---|---|
+| Pre-trigger (`remaining ≤ crossfadeSecs + 1`) en `handleTimeUpdate` | **Crossfade** (objetivo principal) |
+| `onEnded` (canción terminó sin pre-trigger) | Crossfade (cliente) o switch inmediato (fallback) |
+| Silencio detectado RMS < threshold durante `silenceSecs` (default 1s) | **Switch inmediato** (PV-003: la canción ya está en silencio, no hay nada que fade-out) |
+| Admin pulsa "Skip" (`handleSkip`) | **Switch inmediato** (acción explícita del DJ) |
+
+### Detalles importantes
+
+- **Espera `canplay`** antes de empezar el fade — sin esto, los primeros segundos del crossfade son silencio mientras el navegador buferea
+- **Mutex `advancingRef.current`** (PlayerView) — previene doble avance. Se libera automáticamente tras 5s si el callback nunca llega
+- **`crossfadeMsRef.current`** se actualiza dinámicamente al recibir `player:crossfade-config`
+- Pre-trigger calculado como `crossfadeMs/1000 + 1` segundos antes del final
+- `handleEnded(false, true)` (fromSilence=true) → switch inmediato, no crossfade
+
+---
+
+## Sincronización background → foreground (✅ Implementado 2026-06-01)
+
+En móvil, cuando la pestaña/PWA está en background:
+- Los timers JS (`setInterval`, `setTimeout`, `rAF`) se throttean a >1s
+- El socket.io puede desconectarse
+- El pre-trigger nunca dispara
+- Si la canción acaba: `handleEnded` llama `socket.emit('auto-next', cb)` pero el callback nunca llega (socket desconectado), `advancingRef.current` queda en `true` para siempre
+- El servidor avanza por su lado (`scheduleSongEnd` safety) y emite `player:update`, pero el cliente lo IGNORA por el mutex
+- Resultado: el audio se queda parado, solo arranca cuando el usuario vuelve a foreground
+
+### Mecanismos de recuperación
+
+1. **Liberación del mutex obsoleto**: `player:update` no se ignora si `advancingRef` lleva > 3 segundos pegado
+2. **`syncWithServer()`** en PlayerView y `onAdminVisibility()` en UnifiedView:
+   - Llamado en `visibilitychange` (back to foreground) y `socket.on('connect')`
+   - Hace `fetch /api/now-playing`
+   - Si el src actual del audio ≠ desired: `doImmediateSwitch(song)`
+   - Si es igual pero pausado: reintenta `play()`
+3. **Server safety timer** (`scheduleSongEnd`): el servidor avanza la cola 2 segundos después del final esperado de la canción si nadie ha pedido `next`. Esto garantiza que `nowPlaying` esté siempre actualizado en el servidor independientemente del estado del cliente.
+4. **Guard timeout en `handleEnded`**: 5 segundos máximos para que el callback de `auto-next` libere `advancingRef`
+
+### Verificado con test E2E
+
+Test simula:
+1. Pestaña en foreground → reproduce canción A
+2. Marca `document.hidden = true` + `Emulation.setHiddenAndMuted`
+3. POST `/api/player/next` (simula safety timer del servidor)
+4. Marca pestaña como visible
+5. Verifica que `audio.src` se actualizó a la nueva canción Y que `paused === false`
+
+Resultado: ✅ AFTER WAKE: src changed to new song / audio is PLAYING
 
 ---
 
@@ -296,6 +369,10 @@ Y en `onVisibility`, si `getActive()?.paused === false` (está "playing" según 
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-06-01 | **Crossfade VERIFICADO funcionando** — fix de background sync (cliente recupera estado tras volver de background), eliminado servicio duplicado `jukevote.service` (queda solo `turiadj.service`), `scheduleSongEnd` safety reducido de +8s a +2s |
+| 2026-06-01 | Crossfade configurable 1–10s (default 4s) — slider en RemoteView y panel admin Control, `POST /api/player/crossfade-config`, persistido en `state.crossfade_ms` |
+| 2026-06-01 | Botón "Borrar caché y recargar" en pestaña Sesión del panel admin |
+| 2026-06-01 | `Cache-Control: no-store` en `/` e `/index.html` para que el navegador siempre cargue el JS más reciente (los assets con hash siguen cacheándose normalmente) |
 | 2026-05-24 | PlayerView: PV-001–004 — MediaSession API, precarga, config silencio en RemoteView, recovery AudioContext |
 | 2026-05-24 | PlayerView: crossfader 3s + detección de silencio + fix background/foreground |
 | 2026-05-24 | Auditoría de seguridad completa — 20 hallazgos documentados en audit-report.md |
