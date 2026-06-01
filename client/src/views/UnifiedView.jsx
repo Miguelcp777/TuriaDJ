@@ -879,6 +879,19 @@ export default function UnifiedView() {
       } else if (currentUser?.role !== 'admin') {
         // voter: reconnect to live broadcast on song change
         setVoterListeningSong(song);
+      } else if (currentUser?.role === 'admin') {
+        // Admin: si el src actual del audio activo NO es la nueva canción,
+        // significa que el servidor avanzó pero el cliente no detectó el
+        // pre-trigger (estaba en background o algo). Cargar el nuevo src.
+        const active = getActive();
+        const desiredSrc = '/api/stream/' + song.id;
+        if (active && active.src && !active.src.endsWith(desiredSrc) && !fadeScheduled.current) {
+          console.log('[UnifiedView] background sync: server advanced, loading new song');
+          cancelAnimationFrame(crossfadeRaf.current);
+          fadeScheduled.current = false;
+          [audioA.current, audioB.current].forEach(a => { if (a && a !== active) { a.pause(); a.src = ''; a.volume = 1; } });
+          loadAndPlay(song);
+        }
       }
     });
     socket.on('player:progress', (data) => {
@@ -924,9 +937,44 @@ export default function UnifiedView() {
     const emitJoin = () => socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
     emitJoin();
     socket.on('connect', emitJoin);
+
+    // ── Sincronización al volver del background ───────────────────────────
+    // En móvil/PWA, cuando la pestaña está en background:
+    //   - Los timers se throttean a >1s
+    //   - El audio puede pararse al terminar la canción y no avanzar (la
+    //     llamada a play() de la siguiente canción es bloqueada por el
+    //     navegador o el src nunca se actualiza)
+    // Al volver al foreground, comprobamos /api/now-playing y si la canción
+    // que estaba sonando ya no coincide, cargamos la nueva.
+    const onAdminVisibility = () => {
+      if (document.hidden || currentUser?.role !== 'admin') return;
+      fetch('/api/now-playing').then(r => r.json()).then(song => {
+        if (!song) return;
+        const active = getActive();
+        const desiredSrc = '/api/stream/' + song.id;
+        if (active && (!active.src || !active.src.endsWith(desiredSrc))) {
+          console.log('[UnifiedView] visibility sync: load', song.title);
+          cancelAnimationFrame(crossfadeRaf.current);
+          fadeScheduled.current = false;
+          loadAndPlay(song);
+        } else if (active && active.paused) {
+          // Mismo src pero pausado por autoplay policy: reintentar play()
+          active.play().then(() => setIsPlaying(true)).catch(() => {});
+        }
+      }).catch(() => {});
+    };
+    document.addEventListener('visibilitychange', onAdminVisibility);
     socket.on('spooty:ready', ({ message }) => { setSpootyOpen(false); setSpootyStatus('idle'); setSpootyUrl(''); showToast('✅ ' + message, 7000); });
     socket.on('spooty:error', ({ message }) => { setSpootyStatus('error'); setSpootyError(message); });
-    return () => { socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress'); socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online'); socket.off('player:silence-config'); socket.off('player:cmd'); socket.off('spooty:ready'); socket.off('spooty:error'); socket.off('connect', emitJoin); socket.off('chat:history'); socket.off('chat:message'); socket.off('chat:toggle'); socket.off('chat:clear'); socket.off('session:timer'); };
+    return () => {
+      socket.off('queue:update'); socket.off('player:update'); socket.off('player:progress');
+      socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online');
+      socket.off('player:silence-config'); socket.off('player:crossfade-config');
+      socket.off('player:cmd'); socket.off('spooty:ready'); socket.off('spooty:error');
+      socket.off('connect', emitJoin); socket.off('chat:history'); socket.off('chat:message');
+      socket.off('chat:toggle'); socket.off('chat:clear'); socket.off('session:timer');
+      document.removeEventListener('visibilitychange', onAdminVisibility);
+    };
   }, [authToken, currentUser]);
 
   useEffect(() => {

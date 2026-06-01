@@ -523,7 +523,11 @@ function scheduleSongEnd(songId, durationSecs) {
   clearSongEndTimer();
   // Si la canción no tiene duración en metadatos, fallback de 10 minutos
   const safeDuration = (durationSecs && durationSecs > 0) ? durationSecs : 600;
-  const delay = (safeDuration + 8) * 1000;
+  // +2s de buffer: si el cliente está en foreground, su pre-trigger ya habrá
+  // pedido next; si está en background y no ha pedido, avanzamos rápido para
+  // que el nuevo player:update llegue antes de que pasen demasiados segundos
+  // de silencio aparente en el broadcast.
+  const delay = (safeDuration + 2) * 1000;
   songEndTimer = setTimeout(async () => {
     songEndTimer = null;
     const current = db.getNowPlaying();

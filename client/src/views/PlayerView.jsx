@@ -262,13 +262,14 @@ export default function PlayerView() {
     stopSilenceMonitor();
     setIsPlaying(false);
 
-    // Guard: liberar mutex si el servidor no responde en 15s
+    // Guard: liberar mutex si el servidor no responde en 5s (acortado para
+    // facilitar la recuperación tras un background prolongado).
     const guard = setTimeout(() => {
       if (advancingRef.current) {
         console.warn('[PlayerView] advance timeout — liberando mutex');
         advancingRef.current = false;
       }
-    }, 15000);
+    }, 5000);
 
     const onSong = (song) => {
       clearTimeout(guard);
@@ -314,9 +315,19 @@ export default function PlayerView() {
       // Cuando PlayerView mismo inicia la transición (handleEnded), el servidor
       // emite player:update vía broadcast ANTES de que llegue la respuesta HTTP.
       // Si procesamos ese evento, stopCrossfade() + active.src = X reinician la
-      // canción desde el principio y corrompen el crossfade. Lo ignoramos:
-      // la respuesta HTTP de handleEnded gestionará la transición por completo.
-      if (advancingRef.current) return;
+      // canción desde el principio y corrompen el crossfade.
+      //
+      // PERO si advancingRef lleva > 3 segundos sin liberarse (porque el socket
+      // se desconectó en background y el callback de auto-next nunca llegó),
+      // dejamos pasar el update para que el cliente se sincronice cuando vuelve
+      // del background. Sin esto, el src nunca se actualiza hasta que el usuario
+      // toca la pantalla.
+      const advancingMs = advancingRef.current ? Date.now() - advancingStartRef.current : 0;
+      if (advancingRef.current && advancingMs < 3000) return;
+      if (advancingRef.current && advancingMs >= 3000) {
+        console.warn('[PlayerView] advancingRef stuck for', advancingMs, 'ms — releasing for player:update');
+        advancingRef.current = false;
+      }
 
       const newSrc = song ? '/api/stream/' + song.id : '';
       // Si ya estamos en crossfade hacia esta misma canción, solo actualizar UI
@@ -388,6 +399,36 @@ export default function PlayerView() {
       }
     });
 
+    // ── Sincronización servidor → cliente al volver del background ─────────
+    // En móvil, cuando la pestaña está en background:
+    //   - El socket puede desconectarse
+    //   - setInterval/setTimeout/rAF se throttean a >1s
+    //   - El servidor avanza la cola por su cuenta (scheduleSongEnd safety)
+    //   - El player:update emitido puede llegar muy tarde o con el mutex
+    //     advancingRef bloqueado de un intento previo de auto-next
+    // Al volver del background, consultamos /api/now-playing y si el src
+    // actual del elemento de audio no coincide, hacemos un switch inmediato.
+    const syncWithServer = () => {
+      fetch('/api/now-playing').then(r => r.json()).then(song => {
+        if (!song) { setNowPlaying(null); return; }
+        const desiredSrc = '/api/stream/' + song.id;
+        if (playingSrcRef.current !== desiredSrc) {
+          console.log('[PlayerView] background sync: current=' + playingSrcRef.current + ' → desired=' + desiredSrc);
+          stopCrossfade();
+          advancingRef.current = false;
+          doImmediateSwitch(song);
+        } else {
+          // Mismo src: solo asegurar que está sonando
+          const active = getActive();
+          if (active?.paused && active?.src) {
+            active.play()
+              .then(() => { setIsPlaying(true); setNeedsTap(false); })
+              .catch(() => { setNeedsTap(true); });
+          }
+        }
+      }).catch(() => {});
+    };
+
     const onVisibility = () => {
       if (!document.hidden) {
         // PV-004: recuperar AudioContext suspendido
@@ -399,24 +440,34 @@ export default function PlayerView() {
           const active = getActive();
 
           if (active?.ended) {
-            // Canción terminó en background: reintentar avance
-            const advancingSecs = (Date.now() - advancingStartRef.current) / 1000;
-            if (!advancingRef.current || advancingSecs > 10) {
-              advancingRef.current = false;
-              handleEnded(false);
-            }
+            // Canción terminó en background: el servidor ya ha avanzado,
+            // sincronizar con /api/now-playing para no reintentar handleEnded
+            // (que reproduciría la misma canción otra vez).
+            advancingRef.current = false;
+            syncWithServer();
 
           } else if (active?.paused && active?.src && !advancingRef.current) {
-            // play() falló en background (política autoplay): reintentar ahora
-            // que el tab está en primer plano y el AudioContext está activo.
-            active.play()
-              .then(() => { setIsPlaying(true); setNeedsTap(false); })
-              .catch(() => { setNeedsTap(true); });
+            // Audio pausado: puede ser que el servidor cambió la canción O
+            // que play() falló por autoplay policy. Sincronizar primero.
+            syncWithServer();
+          } else {
+            // Audio sonando: igual sincronizar por si el src ha cambiado
+            // (el cliente podría llevar reproduciendo la canción anterior
+            // varios segundos extra mientras el servidor ya avanzó).
+            syncWithServer();
           }
         });
       }
     };
     document.addEventListener('visibilitychange', onVisibility);
+
+    // Sincronizar también cuando el socket se reconecta (los browsers
+    // móviles desconectan websockets en background y los reconectan al
+    // volver). Sin esto, el cliente puede quedar con un estado obsoleto.
+    socket.on('connect', () => {
+      // Pequeño delay para que el servidor termine de procesar la reconexión
+      setTimeout(syncWithServer, 200);
+    });
 
     fetch('/api/now-playing').then(r => r.json()).then(song => {
       if (song) {
@@ -438,6 +489,7 @@ export default function PlayerView() {
       socket.off('player:cmd');
       socket.off('player:silence-config');
       socket.off('player:crossfade-config');
+      socket.off('connect');
       document.removeEventListener('visibilitychange', onVisibility);
       stopSilenceMonitor();
       stopCrossfade();
