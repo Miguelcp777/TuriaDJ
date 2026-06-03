@@ -345,12 +345,25 @@ En móvil, cuando la pestaña/PWA está en background:
 
 1. **Liberación del mutex obsoleto**: `player:update` no se ignora si `advancingRef` lleva > 3 segundos pegado
 2. **`syncWithServer()`** en PlayerView y `onAdminVisibility()` en UnifiedView:
-   - Llamado en `visibilitychange` (back to foreground) y `socket.on('connect')`
-   - Hace `fetch /api/now-playing`
+   - Llamado en `visibilitychange` (back to foreground), `socket.on('connect')`, y desde el guard/onEnded cuando un avance no recibe respuesta
+   - Hace `fetch /api/now-playing` (HTTP, **independiente del socket**)
    - Si el src actual del audio ≠ desired: `doImmediateSwitch(song)`
    - Si es igual pero pausado: reintenta `play()`
 3. **Server safety timer** (`scheduleSongEnd`): el servidor avanza la cola 2 segundos después del final esperado de la canción si nadie ha pedido `next`. Esto garantiza que `nowPlaying` esté siempre actualizado en el servidor independientemente del estado del cliente.
-4. **Guard timeout en `handleEnded`**: 5 segundos máximos para que el callback de `auto-next` libere `advancingRef`
+4. **Guard timeout en `handleEnded`** (6s): si el ACK del socket o la respuesta HTTP no llega, libera `advancingRef` Y llama `syncWithServer()` para recuperar activamente (no basta soltar el mutex).
+5. **`handleAudioEnded`**: si la canción termina con un avance en curso pero SIN crossfade iniciado (ACK perdido), recupera vía `syncWithServer()` de inmediato.
+
+### Stall por ACK de socket perdido (⚠️ causa raíz del "a veces no avanza")
+
+El avance automático usa `socket.emit('player:auto-next', {}, cb)` (ack sin timeout). Si el ACK se pierde (wifi saturado, socket reconectando) PERO el servidor SÍ avanzó (y su `player:update` fue ignorado por el mutex `advancingRef`), el reproductor se quedaba parado hasta que el usuario interactuaba. **NO confiar solo en el ACK**: el guard de 6s y `handleAudioEnded` ahora recuperan vía `syncWithServer()` (fetch HTTP, no depende del socket). Verificado con E2E bloqueando `socket.io` por CDP.
+
+### Anti doble-avance en servidor
+
+`advanceQueue({ auto })`: los avances **automáticos** (`player:auto-next` socket + `scheduleSongEnd`) se debouncean 2s para que un solo fin de canción no dispare dos avances (pre-trigger del cliente + safety timer, o varios clientes → saltaría una canción). El **skip explícito** del DJ (`POST /api/player/next`) NO se debouncea. `advanceInFlight` cubre además la carrera del `await` a Navidrome en la rama AutoDJ.
+
+### Bug del doble crossfade (corregido)
+
+En `doCrossfade`, el fallback de 1.5s podía llamar `startPlay()` dos veces si `next.play()` resolvía lento → dos `setInterval` compitiendo (uno se filtraba). Corregido con flag `started` idempotente. La condición vieja `!crossfadeTimer.current` era defectuosa; usar un flag local, no el handle del timer.
 
 ### Verificado con test E2E
 
@@ -369,6 +382,7 @@ Resultado: ✅ AFTER WAKE: src changed to new song / audio is PLAYING
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-06-03 | **Fix stall intermitente "a veces no avanza"** — causa raíz: ACK de `player:auto-next` perdido dejaba el reproductor parado (el `player:update` del servidor era ignorado por el mutex y nada re-disparaba). Ahora el guard (6s) y `handleAudioEnded` recuperan vía `syncWithServer()`. + fix doble-crossfade en `doCrossfade` (flag `started`) + debounce 2s anti doble-avance para avances automáticos en `advanceQueue({auto})`. Verificado con 3 tests E2E en Chromium. |
 | 2026-06-01 | **Crossfade VERIFICADO funcionando** — fix de background sync (cliente recupera estado tras volver de background), eliminado servicio duplicado `jukevote.service` (queda solo `turiadj.service`), `scheduleSongEnd` safety reducido de +8s a +2s |
 | 2026-06-01 | Crossfade configurable 1–10s (default 4s) — slider en RemoteView y panel admin Control, `POST /api/player/crossfade-config`, persistido en `state.crossfade_ms` |
 | 2026-06-01 | Botón "Borrar caché y recargar" en pestaña Sesión del panel admin |
