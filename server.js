@@ -323,54 +323,78 @@ app.post('/api/player/crossfade-config', auth.adminMiddleware, (req, res) => {
 app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res.json(song ? { ...song, position: lastProgress.position } : null); });
 
 // ── advanceQueue: lógica de avance compartida entre HTTP y socket ─────────────
-async function advanceQueue() {
-  clearSongEndTimer(); // cancelar el timer de la canción anterior
-  const queue = db.getQueue();
-  if (!queue.length) {
-    if (db.getAutoDJEnabled()) {
-      try {
-        const selectedPlaylists = db.getAutoDJPlaylists();
-        let songs = [];
-        if (selectedPlaylists.length > 0) {
-          const playlistId = selectedPlaylists[Math.floor(Math.random() * selectedPlaylists.length)];
-          songs = await nd.getPlaylistSongs(playlistId);
-        } else {
-          songs = await nd.getRandomSongs(20);
-        }
-        if (!songs.length) {
+// Protección contra doble avance:
+//   - `auto:true` (avances AUTOMÁTICOS: auto-next del cliente + safety timer del
+//     servidor + otros clientes) se DEBOUNCEan: si ya hubo un avance automático
+//     hace < 2s, devolvemos la canción actual sin avanzar otra vez. Esto evita
+//     que el fin de una canción dispare dos avances (saltándose una canción)
+//     cuando coinciden el pre-trigger del cliente y el safety timer, o cuando
+//     hay varios clientes (PlayerView + panel admin) abiertos.
+//   - El skip EXPLÍCITO del DJ (`POST /api/player/next`, sin `auto`) NO se
+//     debouncea: pulsar "siguiente" varias veces seguidas debe saltar varias.
+//   - `advanceInFlight` cubre la carrera en la rama AutoDJ (que tiene un await
+//     a Navidrome): dos llamadas concurrentes no deben elegir dos canciones.
+let advanceInFlight = false;
+let lastAutoAdvanceAt = 0;
+async function advanceQueue({ auto = false } = {}) {
+  if (auto) {
+    const now = Date.now();
+    if (now - lastAutoAdvanceAt < 2000) return db.getNowPlaying();
+    lastAutoAdvanceAt = now;
+  }
+  if (advanceInFlight) return db.getNowPlaying();
+  advanceInFlight = true;
+  try {
+    clearSongEndTimer(); // cancelar el timer de la canción anterior
+    const queue = db.getQueue();
+    if (!queue.length) {
+      if (db.getAutoDJEnabled()) {
+        try {
+          const selectedPlaylists = db.getAutoDJPlaylists();
+          let songs = [];
+          if (selectedPlaylists.length > 0) {
+            const playlistId = selectedPlaylists[Math.floor(Math.random() * selectedPlaylists.length)];
+            songs = await nd.getPlaylistSongs(playlistId);
+          } else {
+            songs = await nd.getRandomSongs(20);
+          }
+          if (!songs.length) {
+            db.clearNowPlaying(); autoDJActive = false; broadcast();
+            io.emit('autodj:update', { enabled: true, active: false });
+            return null;
+          }
+          const pick = songs[Math.floor(Math.random() * songs.length)];
+          db.setNowPlaying(pick);
+          lastProgress = { position: 0 };
+          startBroadcast(pick.id, pick.duration || 0);
+          autoDJActive = true;
+          broadcast();
+          io.emit('autodj:update', { enabled: true, active: true });
+          scheduleSongEnd(pick.id, pick.duration || 0); // safety net
+          return pick;
+        } catch (e) {
+          console.error('AutoDJ error:', e.message);
           db.clearNowPlaying(); autoDJActive = false; broadcast();
           io.emit('autodj:update', { enabled: true, active: false });
           return null;
         }
-        const pick = songs[Math.floor(Math.random() * songs.length)];
-        db.setNowPlaying(pick);
-        lastProgress = { position: 0 };
-        startBroadcast(pick.id, pick.duration || 0);
-        autoDJActive = true;
-        broadcast();
-        io.emit('autodj:update', { enabled: true, active: true });
-        scheduleSongEnd(pick.id, pick.duration || 0); // safety net
-        return pick;
-      } catch (e) {
-        console.error('AutoDJ error:', e.message);
-        db.clearNowPlaying(); autoDJActive = false; broadcast();
-        io.emit('autodj:update', { enabled: true, active: false });
-        return null;
       }
+      db.clearNowPlaying(); autoDJActive = false; broadcast();
+      return null;
     }
-    db.clearNowPlaying(); autoDJActive = false; broadcast();
-    return null;
+    const next = queue[0];
+    db.removeFromQueue(next.id);
+    db.setNowPlaying(next);
+    lastProgress = { position: 0 };
+    startBroadcast(next.id, next.duration || 0);
+    autoDJActive = false;
+    broadcast();
+    io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
+    scheduleSongEnd(next.id, next.duration || 0); // safety net
+    return next;
+  } finally {
+    advanceInFlight = false;
   }
-  const next = queue[0];
-  db.removeFromQueue(next.id);
-  db.setNowPlaying(next);
-  lastProgress = { position: 0 };
-  startBroadcast(next.id, next.duration || 0);
-  autoDJActive = false;
-  broadcast();
-  io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
-  scheduleSongEnd(next.id, next.duration || 0); // safety net
-  return next;
 }
 
 app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
@@ -534,7 +558,7 @@ function scheduleSongEnd(songId, durationSecs) {
     if (!current || current.id !== songId) return; // client already advanced
     if (!db.getSessionActive()) return;
     console.log('[songEnd] auto-advance for song', songId);
-    try { await advanceQueue(); } catch (e) { console.error('[songEnd] error:', e.message); }
+    try { await advanceQueue({ auto: true }); } catch (e) { console.error('[songEnd] error:', e.message); }
   }, delay);
 }
 
@@ -619,7 +643,7 @@ io.on('connection', socket => {
     if (typeof cb !== 'function') return;
     if (!db.getSessionActive() && !db.getAutoDJEnabled()) return cb({ song: null });
     try {
-      const song = await advanceQueue();
+      const song = await advanceQueue({ auto: true });
       cb({ song });
     } catch (e) {
       console.error('player:auto-next error:', e.message);

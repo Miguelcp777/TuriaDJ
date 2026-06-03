@@ -204,7 +204,14 @@ export default function PlayerView() {
       }, CROSSFADE_TICK);
     };
 
+    // `started` garantiza que next.play() se invoque UNA sola vez. Sin esto, si
+    // canplay dispara startPlay y next.play() tarda en resolver, el fallback de
+    // 1.5s podría llamar startPlay de nuevo → dos setInterval de crossfade
+    // compitiendo (uno se filtra y nunca se limpia), dejando el audio roto.
+    let started = false;
     const startPlay = () => {
+      if (started) return;
+      started = true;
       next.play().then(beginFade).catch(() => {
         next.src = '';
         next.volume = targetVolRef.current;
@@ -224,7 +231,7 @@ export default function PlayerView() {
       next.addEventListener('canplay', onCanPlay, { once: true });
       // Fallback a 1.5s — empezar igual aunque el buffer no esté completo
       setTimeout(() => {
-        if (advancingRef.current && !crossfadeTimer.current) {
+        if (!started && advancingRef.current) {
           next.removeEventListener('canplay', onCanPlay);
           startPlay();
         }
@@ -248,6 +255,35 @@ export default function PlayerView() {
       .catch(() => { setNeedsTap(true); advancingRef.current = false; });
   };
 
+  // ── Sincronización servidor → cliente ──────────────────────────────────────
+  // Consulta /api/now-playing y, si el src del audio activo no coincide con la
+  // canción que el servidor cree que está sonando, hace un switch inmediato.
+  // Se usa para recuperar el estado en tres casos:
+  //   1. Al volver del background (visibilitychange)
+  //   2. Al reconectar el socket
+  //   3. Cuando un avance automático no recibe respuesta del servidor (ack de
+  //      socket perdido): el servidor YA avanzó pero el cliente no se enteró.
+  const syncWithServer = () => {
+    fetch('/api/now-playing').then(r => r.json()).then(song => {
+      if (!song) { setNowPlaying(null); return; }
+      const desiredSrc = '/api/stream/' + song.id;
+      if (playingSrcRef.current !== desiredSrc) {
+        console.log('[PlayerView] sync: ' + playingSrcRef.current + ' → ' + desiredSrc);
+        stopCrossfade();
+        advancingRef.current = false;
+        doImmediateSwitch(song);
+      } else {
+        // Mismo src: solo asegurar que está sonando
+        const active = getActive();
+        if (active?.paused && active?.src) {
+          active.play()
+            .then(() => { setIsPlaying(true); setNeedsTap(false); })
+            .catch(() => { setNeedsTap(true); });
+        }
+      }
+    }).catch(() => {});
+  };
+
   // ── handleEnded ──────────────────────────────────────────────────────────
   // fromSkip    = true  → switch inmediato (el DJ pulsó "siguiente")
   // fromSilence = true  → switch inmediato (silencio detectado > 1s en la pista)
@@ -262,16 +298,12 @@ export default function PlayerView() {
     stopSilenceMonitor();
     setIsPlaying(false);
 
-    // Guard: liberar mutex si el servidor no responde en 5s (acortado para
-    // facilitar la recuperación tras un background prolongado).
-    const guard = setTimeout(() => {
-      if (advancingRef.current) {
-        console.warn('[PlayerView] advance timeout — liberando mutex');
-        advancingRef.current = false;
-      }
-    }, 5000);
+    // `settled` evita que un ACK tardío y el guard se procesen ambos.
+    let settled = false;
 
     const onSong = (song) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(guard);
       if (song) {
         if (fromSkip || fromSilence) { resetPreload(); doImmediateSwitch(song); }
@@ -284,12 +316,32 @@ export default function PlayerView() {
       }
     };
 
+    // Guard de recuperación: si la respuesta (ACK de socket o HTTP) no llega en
+    // 6s, el servidor probablemente YA avanzó la cola — su broadcast
+    // `player:update` fue ignorado por el mutex, o el ACK del socket se perdió
+    // (típico con wifi saturado). En lugar de solo liberar el mutex y quedarnos
+    // esperando un evento que quizá no llegue, recuperamos ACTIVAMENTE el estado
+    // consultando /api/now-playing. Sin esto, si el ACK se pierde justo cuando
+    // la canción termina, el reproductor se queda parado hasta que el usuario
+    // interactúa con la app.
+    const guard = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      console.warn('[PlayerView] avance sin respuesta en 6s — recuperando vía servidor');
+      advancingRef.current = false;
+      syncWithServer();
+    }, 6000);
+
     if (fromSkip) {
       // Skip: usa HTTP con auth (acción admin)
       jwtFetch('/api/player/next', { method: 'POST' })
         .then(r => r.json())
         .then(data => onSong(data?.song ?? null))
-        .catch(() => { clearTimeout(guard); advancingRef.current = false; });
+        .catch(() => {
+          if (settled) return;
+          settled = true; clearTimeout(guard);
+          advancingRef.current = false; syncWithServer();
+        });
     } else {
       // Fin natural: socket acknowledgment sin necesidad de auth
       socket.emit('player:auto-next', {}, (data) => {
@@ -398,36 +450,6 @@ export default function PlayerView() {
         silenceSecondsRef.current = value;
       }
     });
-
-    // ── Sincronización servidor → cliente al volver del background ─────────
-    // En móvil, cuando la pestaña está en background:
-    //   - El socket puede desconectarse
-    //   - setInterval/setTimeout/rAF se throttean a >1s
-    //   - El servidor avanza la cola por su cuenta (scheduleSongEnd safety)
-    //   - El player:update emitido puede llegar muy tarde o con el mutex
-    //     advancingRef bloqueado de un intento previo de auto-next
-    // Al volver del background, consultamos /api/now-playing y si el src
-    // actual del elemento de audio no coincide, hacemos un switch inmediato.
-    const syncWithServer = () => {
-      fetch('/api/now-playing').then(r => r.json()).then(song => {
-        if (!song) { setNowPlaying(null); return; }
-        const desiredSrc = '/api/stream/' + song.id;
-        if (playingSrcRef.current !== desiredSrc) {
-          console.log('[PlayerView] background sync: current=' + playingSrcRef.current + ' → desired=' + desiredSrc);
-          stopCrossfade();
-          advancingRef.current = false;
-          doImmediateSwitch(song);
-        } else {
-          // Mismo src: solo asegurar que está sonando
-          const active = getActive();
-          if (active?.paused && active?.src) {
-            active.play()
-              .then(() => { setIsPlaying(true); setNeedsTap(false); })
-              .catch(() => { setNeedsTap(true); });
-          }
-        }
-      }).catch(() => {});
-    };
 
     const onVisibility = () => {
       if (!document.hidden) {
@@ -557,6 +579,17 @@ export default function PlayerView() {
 
   const handleAudioEnded = (e) => {
     if (e.target !== getActive()) return;
+    // Si ya hay un avance en curso pero el crossfade NO ha empezado (el ACK del
+    // servidor no llegó), la canción local acaba de terminar y no habrá más
+    // eventos que disparen el avance → recuperamos vía servidor de inmediato.
+    if (advancingRef.current) {
+      if (!crossfadeTimer.current) {
+        console.warn('[PlayerView] canción terminó sin avance confirmado — recuperando');
+        advancingRef.current = false;
+        syncWithServer();
+      }
+      return;
+    }
     handleEnded(false);
   };
 
