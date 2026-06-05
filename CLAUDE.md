@@ -321,9 +321,19 @@ Cambios se propagan vía `player:crossfade-config` socket event a todos los clie
 | Silencio detectado RMS < threshold durante `silenceSecs` (default 1s) | **Switch inmediato** (PV-003: la canción ya está en silencio, no hay nada que fade-out) |
 | Admin pulsa "Skip" (`handleSkip`) | **Switch inmediato** (acción explícita del DJ) |
 
+### Precarga de la siguiente canción (CLAVE para el solapamiento)
+
+Para que el crossfade SOLAPE de verdad, la siguiente canción debe estar bufferada **antes** de empezar el fade. `preloadNext()` (en `handleTimeUpdate`, ~90s antes del final) la carga en el elemento `<audio>` inactivo:
+
+- **Modo cola**: la siguiente es `queue[0]`, conocida en el cliente → precarga directa.
+- **Modo AutoDJ**: la cola está vacía, la siguiente la decide el servidor. El cliente emite `socket.emit('player:peek-next', cb)` → el servidor pre-elige y **memoiza** la canción en `pendingAutoDJ` (sin avanzar) y la devuelve. `advanceQueue` luego reproduce **exactamente esa misma** canción (consume `pendingAutoDJ`). Sin esto, en AutoDJ la canción se cargaba recién en el pre-trigger (5s antes del final) → no daba tiempo a bufear → **corte seco** (bug corregido 2026-06-05).
+
+`pendingAutoDJ` se invalida al consumirla, al entrar canciones en la cola, y al terminar la sesión.
+
 ### Detalles importantes
 
 - **Espera `canplay`** antes de empezar el fade — sin esto, los primeros segundos del crossfade son silencio mientras el navegador buferea
+- **`doImmediateSwitch`** (skip / silencio) usa el elemento ya precargado si la canción coincide (flip de `activeRef`, sin recargar) → switch **gapless**
 - **Mutex `advancingRef.current`** (PlayerView) — previene doble avance. Se libera automáticamente tras 5s si el callback nunca llega
 - **`crossfadeMsRef.current`** se actualiza dinámicamente al recibir `player:crossfade-config`
 - Pre-trigger calculado como `crossfadeMs/1000 + 1` segundos antes del final
@@ -382,6 +392,7 @@ Resultado: ✅ AFTER WAKE: src changed to new song / audio is PLAYING
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-06-05 | **Fix crossfade en AutoDJ (corte seco → solapamiento real)** — la siguiente canción de AutoDJ no se precargaba (la cola está vacía y se decidía en el último momento). Nuevo `pickAutoDJSong()` + `pendingAutoDJ` + socket `player:peek-next`: el cliente consulta la siguiente ~90s antes y la precarga; `advanceQueue` reproduce esa misma. `doImmediateSwitch` usa el preload (silencio/skip gapless). Verificado con 3 E2E (solapamiento 4s real, silencio→cambio, preload readyState 4). |
 | 2026-06-03 | **Fix stall intermitente "a veces no avanza"** — causa raíz: ACK de `player:auto-next` perdido dejaba el reproductor parado (el `player:update` del servidor era ignorado por el mutex y nada re-disparaba). Ahora el guard (6s) y `handleAudioEnded` recuperan vía `syncWithServer()`. + fix doble-crossfade en `doCrossfade` (flag `started`) + debounce 2s anti doble-avance para avances automáticos en `advanceQueue({auto})`. Verificado con 3 tests E2E en Chromium. |
 | 2026-06-01 | **Crossfade VERIFICADO funcionando** — fix de background sync (cliente recupera estado tras volver de background), eliminado servicio duplicado `jukevote.service` (queda solo `turiadj.service`), `scheduleSongEnd` safety reducido de +8s a +2s |
 | 2026-06-01 | Crossfade configurable 1–10s (default 4s) — slider en RemoteView y panel admin Control, `POST /api/player/crossfade-config`, persistido en `state.crossfade_ms` |
