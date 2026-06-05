@@ -45,6 +45,7 @@ export default function PlayerView() {
   const crossfadeTimer  = useRef(null);
   const crossfadeMsRef  = useRef(CROSSFADE_MS); // duración del crossfade — configurable
   const preloadedRef    = useRef('');            // PV-002: ID de canción precargada en elemento inactivo
+  const peekInFlight    = useRef(false);          // evita múltiples peek-next simultáneos
   // Web Audio
   const audioCtxRef  = useRef(null);
   const analyserRef  = useRef(null);
@@ -135,15 +136,35 @@ export default function PlayerView() {
   };
 
   // ── PV-002: precarga de la siguiente canción ─────────────────────────────
-  const preloadNext = () => {
-    if (preloadedRef.current || advancingRef.current || crossfadeTimer.current) return;
-    const nextSong = queueRef.current[0];
-    if (!nextSong) return;
+  // Carga el audio de `song` en el elemento INACTIVO y lo marca como precargado.
+  const doPreload = (song) => {
+    if (!song) return;
     const inactive = getInactive();
     if (!inactive) return;
-    inactive.src     = '/api/stream/' + nextSong.id;
+    inactive.src     = '/api/stream/' + song.id;
     inactive.preload = 'auto';
-    preloadedRef.current = nextSong.id;
+    inactive.load();
+    preloadedRef.current = song.id;
+  };
+
+  const preloadNext = () => {
+    if (preloadedRef.current || advancingRef.current || crossfadeTimer.current) return;
+    // Caso cola: la siguiente es conocida en el cliente → precargar ya.
+    const q = queueRef.current;
+    if (q && q.length > 0) { doPreload(q[0]); return; }
+    // Caso AutoDJ (cola vacía): la siguiente la decide el servidor. Le pedimos
+    // qué sonará (peek-next, NO avanza) y la precargamos. Esto es CLAVE para que
+    // el crossfade solape de verdad en AutoDJ: sin esto, la canción se cargaría
+    // recién en el pre-trigger (5s antes del final) y no daría tiempo a bufear.
+    if (peekInFlight.current) return;
+    peekInFlight.current = true;
+    socket.emit('player:peek-next', {}, (data) => {
+      peekInFlight.current = false;
+      const s = data && data.song;
+      if (s && !preloadedRef.current && !advancingRef.current && !crossfadeTimer.current) {
+        doPreload(s);
+      }
+    });
   };
 
   const resetPreload = () => {
@@ -239,11 +260,34 @@ export default function PlayerView() {
     }
   };
 
-  // ── Switch inmediato (skip / song ya terminada) ──────────────────────────
+  // ── Switch inmediato (skip / silencio / song ya terminada) ────────────────
   const doImmediateSwitch = (song) => {
+    const src = '/api/stream/' + song.id;
+
+    // Si la canción ya está PRECARGADA en el elemento inactivo, cambiamos a él
+    // (flip de activeRef) sin recargar → switch instantáneo SIN hueco. Esto hace
+    // que el cambio por silencio y el skip sean gapless cuando hay preload.
+    const inactive = getInactive();
+    if (inactive && preloadedRef.current === song.id && inactive.readyState >= 2) {
+      const current = getActive();
+      playingSrcRef.current = src;
+      preloadedRef.current = '';
+      inactive.volume = targetVolRef.current;
+      updateMediaSession(song);
+      setNowPlaying(song);
+      inactive.play()
+        .then(() => {
+          activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
+          if (current) { current.pause(); current.src = ''; current.volume = targetVolRef.current; }
+          setIsPlaying(true); setNeedsTap(false); advancingRef.current = false;
+        })
+        .catch(() => { setNeedsTap(true); advancingRef.current = false; });
+      return;
+    }
+
+    // Sin preload: recargar en el elemento activo.
     const active = getActive();
     if (!active) { advancingRef.current = false; return; }
-    const src = '/api/stream/' + song.id;
     playingSrcRef.current = src;
     active.volume = targetVolRef.current;
     active.src = src;

@@ -177,6 +177,7 @@ app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
   clearSessionTimer();
   clearSongEndTimer();
   stopBroadcast();
+  pendingAutoDJ = null;
   autoDJActive = false;
   db.setSessionActive(false);
   db.clearAll();
@@ -336,6 +337,29 @@ app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res
 //     a Navidrome): dos llamadas concurrentes no deben elegir dos canciones.
 let advanceInFlight = false;
 let lastAutoAdvanceAt = 0;
+
+// ── Pre-selección de la siguiente canción de AutoDJ ──────────────────────────
+// En AutoDJ la cola está vacía, así que la siguiente canción no se conoce hasta
+// que el servidor la elige. Para que el cliente pueda PRECARGARLA con tiempo y
+// hacer un crossfade real (en vez de cargarla en el último momento → corte
+// seco), pre-elegimos la canción y la guardamos en `pendingAutoDJ`. El cliente
+// la consulta vía `player:peek-next` ~90s antes del final y la precarga; cuando
+// llega el avance, `advanceQueue` reproduce EXACTAMENTE esa misma canción.
+let pendingAutoDJ = null;
+
+async function pickAutoDJSong() {
+  const selectedPlaylists = db.getAutoDJPlaylists();
+  let songs = [];
+  if (selectedPlaylists.length > 0) {
+    const playlistId = selectedPlaylists[Math.floor(Math.random() * selectedPlaylists.length)];
+    songs = await nd.getPlaylistSongs(playlistId);
+  } else {
+    songs = await nd.getRandomSongs(20);
+  }
+  if (!songs.length) return null;
+  return songs[Math.floor(Math.random() * songs.length)];
+}
+
 async function advanceQueue({ auto = false } = {}) {
   if (auto) {
     const now = Date.now();
@@ -350,20 +374,15 @@ async function advanceQueue({ auto = false } = {}) {
     if (!queue.length) {
       if (db.getAutoDJEnabled()) {
         try {
-          const selectedPlaylists = db.getAutoDJPlaylists();
-          let songs = [];
-          if (selectedPlaylists.length > 0) {
-            const playlistId = selectedPlaylists[Math.floor(Math.random() * selectedPlaylists.length)];
-            songs = await nd.getPlaylistSongs(playlistId);
-          } else {
-            songs = await nd.getRandomSongs(20);
-          }
-          if (!songs.length) {
+          // Usar la canción pre-elegida (que el cliente ya precargó) si existe;
+          // si no, elegir una ahora. Limpiar la pre-selección al consumirla.
+          const pick = pendingAutoDJ || await pickAutoDJSong();
+          pendingAutoDJ = null;
+          if (!pick) {
             db.clearNowPlaying(); autoDJActive = false; broadcast();
             io.emit('autodj:update', { enabled: true, active: false });
             return null;
           }
-          const pick = songs[Math.floor(Math.random() * songs.length)];
           db.setNowPlaying(pick);
           lastProgress = { position: 0 };
           startBroadcast(pick.id, pick.duration || 0);
@@ -382,6 +401,9 @@ async function advanceQueue({ auto = false } = {}) {
       db.clearNowPlaying(); autoDJActive = false; broadcast();
       return null;
     }
+    // Hay cola: la siguiente sale de la cola; invalidar cualquier pre-selección
+    // de AutoDJ para que no quede obsoleta.
+    pendingAutoDJ = null;
     const next = queue[0];
     db.removeFromQueue(next.id);
     db.setNowPlaying(next);
@@ -567,6 +589,7 @@ function autoEndSession() {
   db.setSetting('session_end_time', '');
   clearSongEndTimer();
   stopBroadcast();
+  pendingAutoDJ = null;
   autoDJActive = false;
   db.setSessionActive(false);
   db.clearAll();
@@ -647,6 +670,24 @@ io.on('connection', socket => {
       cb({ song });
     } catch (e) {
       console.error('player:auto-next error:', e.message);
+      cb({ song: null });
+    }
+  });
+
+  // Peek: qué canción sonará a continuación SIN avanzar la cola. Lo usa el
+  // cliente para precargar la siguiente con tiempo (≈90s antes del final) y
+  // poder hacer un crossfade real. En AutoDJ pre-elige y memoiza la canción en
+  // `pendingAutoDJ` para que el avance posterior reproduzca exactamente esa.
+  socket.on('player:peek-next', async (_, cb) => {
+    if (typeof cb !== 'function') return;
+    try {
+      const queue = db.getQueue();
+      if (queue.length) return cb({ song: queue[0] });
+      if (!db.getAutoDJEnabled()) return cb({ song: null });
+      if (!pendingAutoDJ) pendingAutoDJ = await pickAutoDJSong();
+      cb({ song: pendingAutoDJ });
+    } catch (e) {
+      console.error('player:peek-next error:', e.message);
       cb({ song: null });
     }
   });
