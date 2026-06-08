@@ -294,6 +294,25 @@ Y en `onVisibility`, si `getActive()?.paused === false` (está "playing" según 
 
 ---
 
+## Robustez de sesión en eventos largos (✅ 2026-06-07)
+
+Tras horas con la sesión abierta de forma **indefinida**, el panel admin en móvil (`UnifiedView.jsx`) se degradaba. Mecanismos implementados (todos gated a `role === 'admin'`; `PlayerView.jsx` NO se toca):
+
+### Servidor (`server.js`)
+- **`resetRuntimeState()`**: pone a cero TODO el estado efímero (`advanceInFlight`, `lastAutoAdvanceAt`, `lastProgress`, `pendingAutoDJ`, `autoDJActive`, `chatMessages`, `onlineUsers`, `chatRateLimit`). Se llama al **iniciar** y **terminar** sesión → cada sesión empieza/termina pristina y no hereda estado viejo (p.ej. un `advanceInFlight` colgado que bloquearía todos los avances).
+- **Heartbeat**: `io.emit('heartbeat', Date.now())` cada 10s. Permite al watchdog del cliente detectar un socket muerto en ~20s (el `ping-timeout` de socket.io tarda ~45s).
+- **`startBroadcast`**: `bcastGen` (token de generación) evita un segundo `bcastTicker` si una promesa axios vieja resuelve tarde; `timeout: 15000` (antes `0`) acota la conexión a Navidrome.
+
+### Cliente (`UnifiedView.jsx`)
+- **`resyncAll()`**: re-sincroniza `session/status` + `now-playing` + `queue` + `autodj/status` + `user:join`. Reutiliza la reconciliación de audio (carga solo si el src difiere; reintenta play si está pausado → no reinicia una canción en curso). Se llama en: montaje, `socket.on('connect')` (reconexión), y `visibilitychange` (volver de background). **Antes solo se refrescaba now-playing.**
+- **Watchdog** (`setInterval` 12s, solo con pestaña visible): señal primaria = tiempo sin `heartbeat`/contacto (NO `socket.connected`, que va con retraso). `>20s` → reconectar + `resyncAll`; `>60s` → `guardedReload`. `guardedReload` nunca recarga con pestaña oculta y aplica backoff de 90s (`localStorage.jv_last_reload`) anti-bucle. Recarga preventiva por antigüedad `>6h` solo en idle (sin canción / sesión cerrada).
+- **`session:update`**: al terminar sesión resetea la UI a idle (para ambos `<audio>`, limpia cola/nowPlaying/chat); al reiniciar tras estar cerrada → `resyncAll`.
+- **chatMessages** acotado a 100 (evita crecimiento sin límite en sesiones largas).
+
+Verificado E2E (Chromium, producción): resync background→foreground (canción del servidor + reproduciendo), fin→inicio con globales reseteados (posición 0, autodj inactivo, avance funcional), watchdog detecta socket caído ~25s y recupera sin recarga prematura.
+
+---
+
 ## Crossfade (✅ VERIFICADO funcionando 2026-06-01)
 
 El crossfade de N segundos (configurable 1–10s, default 4s) está verificado con test E2E en Chromium headless. Funciona en:
@@ -392,6 +411,7 @@ Resultado: ✅ AFTER WAKE: src changed to new song / audio is PLAYING
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-06-07 | **Robustez de sesión en eventos largos** — `resetRuntimeState()` en inicio/fin de sesión (servidor), heartbeat cada 10s, watchdog de auto-recuperación en el panel admin (`resyncAll` en reconexión/foreground; recarga con backoff si el socket lleva >60s muerto), trim de chat a 100, `bcastGen`+timeout en broadcast. Solo admin; PlayerView intacto. Verificado E2E. |
 | 2026-06-05 | **Fix crossfade en AutoDJ (corte seco → solapamiento real)** — la siguiente canción de AutoDJ no se precargaba (la cola está vacía y se decidía en el último momento). Nuevo `pickAutoDJSong()` + `pendingAutoDJ` + socket `player:peek-next`: el cliente consulta la siguiente ~90s antes y la precarga; `advanceQueue` reproduce esa misma. `doImmediateSwitch` usa el preload (silencio/skip gapless). Verificado con 3 E2E (solapamiento 4s real, silencio→cambio, preload readyState 4). |
 | 2026-06-03 | **Fix stall intermitente "a veces no avanza"** — causa raíz: ACK de `player:auto-next` perdido dejaba el reproductor parado (el `player:update` del servidor era ignorado por el mutex y nada re-disparaba). Ahora el guard (6s) y `handleAudioEnded` recuperan vía `syncWithServer()`. + fix doble-crossfade en `doCrossfade` (flag `started`) + debounce 2s anti doble-avance para avances automáticos en `advanceQueue({auto})`. Verificado con 3 tests E2E en Chromium. |
 | 2026-06-01 | **Crossfade VERIFICADO funcionando** — fix de background sync (cliente recupera estado tras volver de background), eliminado servicio duplicado `jukevote.service` (queda solo `turiadj.service`), `scheduleSongEnd` safety reducido de +8s a +2s |
