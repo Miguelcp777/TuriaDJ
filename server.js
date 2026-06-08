@@ -30,6 +30,13 @@ let bcastTicker     = null;
 let bcastUpstream   = null;
 let bcastGen        = 0;     // token de generación: invalida promesas de startBroadcast obsoletas
 
+// ── Log de diagnóstico por sesión ────────────────────────────────────────────
+// Se resetea en cada inicio/fin de sesión. Registra eventos clave del motor de
+// avance (servidor) y del cliente PlayerView (vía socket 'client:log').
+const SESSION_LOG_MAX = 300;
+let sessionLog       = [];
+let sessionStartTime = 0;
+
 function bcastTick() {
   if (bcastQueue.length === 0) return;
   const bytesPerTick = Math.ceil(bcastBPS * TICK_MS / 1000);
@@ -47,6 +54,7 @@ function bcastTick() {
 }
 
 function startBroadcast(songId, duration) {
+  slog('broadcast:start', { id: songId.slice(0, 8), dur: duration });
   // Keep existing voter connections alive, just swap source
   if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
   if (bcastUpstream) { try { bcastUpstream.destroy(); } catch(e) {} bcastUpstream = null; }
@@ -168,6 +176,7 @@ app.post('/api/session/info', auth.adminMiddleware, (req, res) => {
 app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
   const { duration } = req.body || {};
   resetRuntimeState();   // baseline limpio: que la sesión nueva no herede estado viejo
+  slog('session:start', { duration: duration || 0 });
   db.setSessionActive(true);
   io.emit('session:update', { active: true, name: db.getSessionName(), desc: db.getSessionDesc() });
   io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
@@ -182,6 +191,7 @@ app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
 });
 
 app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
+  slog('session:end');
   clearSessionTimer();
   clearSongEndTimer();
   stopBroadcast();
@@ -369,12 +379,20 @@ async function pickAutoDJSong() {
 }
 
 async function advanceQueue({ auto = false } = {}) {
+  slog('advance:call', { auto });
   if (auto) {
     const now = Date.now();
-    if (now - lastAutoAdvanceAt < 2000) return db.getNowPlaying();
+    const msSinceLast = now - lastAutoAdvanceAt;
+    if (msSinceLast < 2000) {
+      slog('advance:debounced', { ms: Math.round(msSinceLast) });
+      return db.getNowPlaying();
+    }
     lastAutoAdvanceAt = now;
   }
-  if (advanceInFlight) return db.getNowPlaying();
+  if (advanceInFlight) {
+    slog('advance:locked');
+    return db.getNowPlaying();
+  }
   advanceInFlight = true;
   try {
     clearSongEndTimer(); // cancelar el timer de la canción anterior
@@ -384,13 +402,16 @@ async function advanceQueue({ auto = false } = {}) {
         try {
           // Usar la canción pre-elegida (que el cliente ya precargó) si existe;
           // si no, elegir una ahora. Limpiar la pre-selección al consumirla.
+          const wasPending = !!pendingAutoDJ;
           const pick = pendingAutoDJ || await pickAutoDJSong();
           pendingAutoDJ = null;
           if (!pick) {
+            slog('advance:empty', { source: 'autodj', reason: 'no-songs' });
             db.clearNowPlaying(); autoDJActive = false; broadcast();
             io.emit('autodj:update', { enabled: true, active: false });
             return null;
           }
+          slog('advance:autodj', { id: pick.id.slice(0, 8), title: (pick.title || '').slice(0, 30), pending: wasPending });
           db.setNowPlaying(pick);
           lastProgress = { position: 0 };
           startBroadcast(pick.id, pick.duration || 0);
@@ -400,12 +421,14 @@ async function advanceQueue({ auto = false } = {}) {
           scheduleSongEnd(pick.id, pick.duration || 0); // safety net
           return pick;
         } catch (e) {
+          slog('advance:error', { err: e.message });
           console.error('AutoDJ error:', e.message);
           db.clearNowPlaying(); autoDJActive = false; broadcast();
           io.emit('autodj:update', { enabled: true, active: false });
           return null;
         }
       }
+      slog('advance:empty', { source: 'queue', autodj: false });
       db.clearNowPlaying(); autoDJActive = false; broadcast();
       return null;
     }
@@ -413,6 +436,7 @@ async function advanceQueue({ auto = false } = {}) {
     // de AutoDJ para que no quede obsoleta.
     pendingAutoDJ = null;
     const next = queue[0];
+    slog('advance:queue', { id: next.id.slice(0, 8), title: (next.title || '').slice(0, 30) });
     db.removeFromQueue(next.id);
     db.setNowPlaying(next);
     lastProgress = { position: 0 };
@@ -582,11 +606,16 @@ function scheduleSongEnd(songId, durationSecs) {
   // que el nuevo player:update llegue antes de que pasen demasiados segundos
   // de silencio aparente en el broadcast.
   const delay = (safeDuration + 2) * 1000;
+  slog('songEnd:sched', { id: songId.slice(0, 8), sec: Math.round(delay / 1000) });
   songEndTimer = setTimeout(async () => {
     songEndTimer = null;
     const current = db.getNowPlaying();
-    if (!current || current.id !== songId) return; // client already advanced
+    if (!current || current.id !== songId) {
+      slog('songEnd:skip', { id: songId.slice(0, 8), reason: 'already-advanced' });
+      return; // client already advanced
+    }
     if (!db.getSessionActive()) return;
+    slog('songEnd:fire', { id: songId.slice(0, 8) });
     console.log('[songEnd] auto-advance for song', songId);
     try { await advanceQueue({ auto: true }); } catch (e) { console.error('[songEnd] error:', e.message); }
   }, delay);
@@ -648,7 +677,25 @@ function resetRuntimeState() {
   chatMessages.length = 0;                // vacía buffer de chat (mutar array const)
   onlineUsers.clear();
   chatRateLimit.clear();
+  sessionLog.length   = 0;               // vacía log de diagnóstico de la sesión anterior
+  sessionStartTime    = Date.now();
 }
+
+// slog: registra un evento en el log de sesión y lo emite en tiempo real.
+// Usa declaración `function` (hoisted) para que los módulos superiores
+// puedan llamarla antes de que aparezca textualmente.
+function slog(event, data = {}) {
+  const elapsed = sessionStartTime > 0 ? Math.round((Date.now() - sessionStartTime) / 1000) : 0;
+  const entry   = { ts: Date.now(), elapsed, event, ...data };
+  sessionLog.push(entry);
+  if (sessionLog.length > SESSION_LOG_MAX) sessionLog.shift();
+  io.emit('session:log', entry);
+}
+
+// Devuelve el log completo de la sesión activa (solo admin)
+app.get('/api/admin/log', auth.adminMiddleware, (req, res) => {
+  res.json(sessionLog);
+});
 
 io.on('connection', socket => {
   socket.emit('queue:update',   db.getQueue());
@@ -686,6 +733,7 @@ io.on('connection', socket => {
   // Avance automático desde PlayerView — sin auth, el servidor valida que haya sesión activa
   socket.on('player:auto-next', async (_, cb) => {
     if (typeof cb !== 'function') return;
+    slog('autoNext:recv');
     if (!db.getSessionActive() && !db.getAutoDJEnabled()) return cb({ song: null });
     try {
       const song = await advanceQueue({ auto: true });
@@ -702,6 +750,7 @@ io.on('connection', socket => {
   // `pendingAutoDJ` para que el avance posterior reproduzca exactamente esa.
   socket.on('player:peek-next', async (_, cb) => {
     if (typeof cb !== 'function') return;
+    slog('peekNext:recv', { hasPending: !!pendingAutoDJ });
     try {
       const queue = db.getQueue();
       if (queue.length) return cb({ song: queue[0] });
@@ -713,6 +762,14 @@ io.on('connection', socket => {
       cb({ song: null });
     }
   });
+
+  // Log de diagnóstico del cliente (PlayerView emite eventos via socket)
+  socket.on('client:log', ({ event, data } = {}) => {
+    if (typeof event === 'string') slog('client:' + event, data || {});
+  });
+
+  // Enviar log histórico de la sesión a la nueva conexión
+  socket.emit('session:log:init', sessionLog);
 
   // Silence config: send persisted values to new connection
   socket.emit('player:silence-config', {

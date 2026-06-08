@@ -20,6 +20,11 @@ const jwtFetch = (url, opts = {}) => {
   });
 };
 
+// Envía un evento de diagnóstico al servidor (registrado en sessionLog)
+const clog = (event, data = {}) => {
+  try { socket.emit('client:log', { event, data }); } catch {}
+};
+
 function fmtDur(s) {
   if (!s || isNaN(s)) return '0:00';
   const m = Math.floor(s / 60), sec = Math.floor(s % 60);
@@ -126,6 +131,7 @@ export default function PlayerView() {
       if (rms < silenceThresholdRef.current) {
         if (!silenceStart.current) silenceStart.current = Date.now();
         else if (Date.now() - silenceStart.current >= silenceSecondsRef.current * 1000) {
+          clog('silence:detected', { rms: rms.toFixed(3) });
           stopSilenceMonitor();
           handleEnded(false, true); // silencio detectado → switch inmediato
         }
@@ -183,6 +189,7 @@ export default function PlayerView() {
     const next    = getInactive();
     if (!current || !next) { advancingRef.current = false; return; }
 
+    clog('crossfade:start', { song: (song.title || '').slice(0, 30), ms: crossfadeMsRef.current, preloaded: preloadedRef.current === song.id });
     const newSrc = '/api/stream/' + song.id;
     playingSrcRef.current = newSrc;
 
@@ -220,6 +227,7 @@ export default function PlayerView() {
           current.src    = '';
           current.volume = vol;
           advancingRef.current = false;
+          clog('crossfade:done', { song: (song.title || '').slice(0, 30) });
           console.log(`[crossfade] DONE → active is now ${activeRef.current}`);
         }
       }, CROSSFADE_TICK);
@@ -263,6 +271,7 @@ export default function PlayerView() {
   // ── Switch inmediato (skip / silencio / song ya terminada) ────────────────
   const doImmediateSwitch = (song) => {
     const src = '/api/stream/' + song.id;
+    clog('immediateSwitch', { song: (song.title || '').slice(0, 30), preloaded: preloadedRef.current === song.id });
 
     // Si la canción ya está PRECARGADA en el elemento inactivo, cambiamos a él
     // (flip de activeRef) sin recargar → switch instantáneo SIN hueco. Esto hace
@@ -307,11 +316,13 @@ export default function PlayerView() {
   //   2. Al reconectar el socket
   //   3. Cuando un avance automático no recibe respuesta del servidor (ack de
   //      socket perdido): el servidor YA avanzó pero el cliente no se enteró.
-  const syncWithServer = () => {
+  const syncWithServer = (reason = '') => {
+    clog('sync:call', { reason });
     fetch('/api/now-playing').then(r => r.json()).then(song => {
       if (!song) { setNowPlaying(null); return; }
       const desiredSrc = '/api/stream/' + song.id;
       if (playingSrcRef.current !== desiredSrc) {
+        clog('sync:switch', { reason, song: (song.title || '').slice(0, 30) });
         console.log('[PlayerView] sync: ' + playingSrcRef.current + ' → ' + desiredSrc);
         stopCrossfade();
         advancingRef.current = false;
@@ -320,6 +331,7 @@ export default function PlayerView() {
         // Mismo src: solo asegurar que está sonando
         const active = getActive();
         if (active?.paused && active?.src) {
+          clog('sync:resume', { reason });
           active.play()
             .then(() => { setIsPlaying(true); setNeedsTap(false); })
             .catch(() => { setNeedsTap(true); });
@@ -339,6 +351,7 @@ export default function PlayerView() {
     if (advancingRef.current) return;
     advancingRef.current = true;
     advancingStartRef.current = Date.now();
+    clog('handleEnded', { skip: fromSkip, silence: fromSilence });
     stopSilenceMonitor();
     setIsPlaying(false);
 
@@ -372,8 +385,9 @@ export default function PlayerView() {
       if (settled) return;
       settled = true;
       console.warn('[PlayerView] avance sin respuesta en 6s — recuperando vía servidor');
+      clog('guard:timeout', { fromSkip, fromSilence });
       advancingRef.current = false;
-      syncWithServer();
+      syncWithServer('guard');
     }, 6000);
 
     if (fromSkip) {
@@ -384,7 +398,8 @@ export default function PlayerView() {
         .catch(() => {
           if (settled) return;
           settled = true; clearTimeout(guard);
-          advancingRef.current = false; syncWithServer();
+          clog('skip:error');
+          advancingRef.current = false; syncWithServer('skip-fail');
         });
     } else {
       // Fin natural: socket acknowledgment sin necesidad de auth
@@ -422,6 +437,7 @@ export default function PlayerView() {
       if (advancingRef.current && advancingMs < 3000) return;
       if (advancingRef.current && advancingMs >= 3000) {
         console.warn('[PlayerView] advancingRef stuck for', advancingMs, 'ms — releasing for player:update');
+        clog('advancing:stuck', { ms: advancingMs });
         advancingRef.current = false;
       }
 
@@ -497,6 +513,7 @@ export default function PlayerView() {
 
     const onVisibility = () => {
       if (!document.hidden) {
+        clog('visibility:foreground');
         // PV-004: recuperar AudioContext suspendido
         const resumeCtx = audioCtxRef.current?.state === 'suspended'
           ? audioCtxRef.current.resume().catch(() => {})
@@ -510,17 +527,17 @@ export default function PlayerView() {
             // sincronizar con /api/now-playing para no reintentar handleEnded
             // (que reproduciría la misma canción otra vez).
             advancingRef.current = false;
-            syncWithServer();
+            syncWithServer('visibility-ended');
 
           } else if (active?.paused && active?.src && !advancingRef.current) {
             // Audio pausado: puede ser que el servidor cambió la canción O
             // que play() falló por autoplay policy. Sincronizar primero.
-            syncWithServer();
+            syncWithServer('visibility-paused');
           } else {
             // Audio sonando: igual sincronizar por si el src ha cambiado
             // (el cliente podría llevar reproduciendo la canción anterior
             // varios segundos extra mientras el servidor ya avanzó).
-            syncWithServer();
+            syncWithServer('visibility-playing');
           }
         });
       }
@@ -532,7 +549,7 @@ export default function PlayerView() {
     // volver). Sin esto, el cliente puede quedar con un estado obsoleto.
     socket.on('connect', () => {
       // Pequeño delay para que el servidor termine de procesar la reconexión
-      setTimeout(syncWithServer, 200);
+      setTimeout(() => syncWithServer('reconnect'), 200);
     });
 
     fetch('/api/now-playing').then(r => r.json()).then(song => {
@@ -598,6 +615,7 @@ export default function PlayerView() {
       // periodo configurado, en lugar de fade-in desde silencio post-canción.
       const preTrigger = Math.ceil(crossfadeMsRef.current / 1000) + 1;
       if (remaining <= preTrigger && remaining > 0 && !advancingRef.current && !crossfadeTimer.current) {
+        clog('pretrigger', { rem: parseFloat(remaining.toFixed(1)), pt: preTrigger });
         console.log(`[crossfade] pre-trigger at ${remaining.toFixed(2)}s remaining (preTrigger=${preTrigger}s)`);
         handleEnded(false);
       }
@@ -629,11 +647,13 @@ export default function PlayerView() {
     if (advancingRef.current) {
       if (!crossfadeTimer.current) {
         console.warn('[PlayerView] canción terminó sin avance confirmado — recuperando');
+        clog('audioEnded:stuck');
         advancingRef.current = false;
-        syncWithServer();
+        syncWithServer('audioEnded');
       }
       return;
     }
+    clog('audioEnded');
     handleEnded(false);
   };
 

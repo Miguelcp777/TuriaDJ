@@ -163,7 +163,22 @@ function AdminDashboard({
   const [confirmDelete, setConfirmDelete] = useState(null);
   const [roleSaving,    setRoleSaving]   = useState(null);
 
+  // Log tab
+  const [sessionLogs, setSessionLogs] = useState([]);
+
   useEffect(() => { if (tab === 'users') loadUsers(); }, [tab]);
+  useEffect(() => {
+    if (tab !== 'log') return;
+    authFetch('/api/admin/log').then(r => r.json()).then(setSessionLogs).catch(() => {});
+  }, [tab]);
+  useEffect(() => {
+    const handler = (entry) => setSessionLogs(prev => {
+      const n = [...prev, entry];
+      return n.length > 300 ? n.slice(-300) : n;
+    });
+    socket.on('session:log', handler);
+    return () => socket.off('session:log', handler);
+  }, []);
   useEffect(() => {
     if (tab !== 'control') return;
     setPlsLoading(true);
@@ -249,7 +264,22 @@ function AdminDashboard({
   const doDelete   = async id => { await fetch('/api/admin/users/' + id, { method: 'DELETE', headers: { Authorization: 'Bearer ' + authToken } }); setConfirmDelete(null); loadUsers(); };
   const adminCount = users.filter(u => u.role === 'admin').length;
 
-  const TABS = [{ id: 'control', label: 'Control' }, { id: 'cola', label: 'Cola' }, { id: 'sesion', label: 'Sesión' }, { id: 'users', label: 'Usuarios' }];
+  const TABS = [{ id: 'control', label: 'Control' }, { id: 'cola', label: 'Cola' }, { id: 'sesion', label: 'Sesión' }, { id: 'users', label: 'Usuarios' }, { id: 'log', label: '🔍 Log' }];
+
+  const logEventColor = (event) => {
+    if (event === 'advance:queue' || event === 'advance:autodj') return 'text-green-400';
+    if (event.startsWith('advance:')) return 'text-orange-400';
+    if (event.startsWith('broadcast:')) return 'text-purple-400';
+    if (event.startsWith('songEnd:')) return 'text-yellow-400';
+    if (event === 'client:pretrigger' || event.startsWith('client:crossfade') || event === 'client:immediateSwitch') return 'text-blue-400';
+    if (event === 'client:handleEnded') return 'text-indigo-300';
+    if (event.startsWith('client:sync') || event.startsWith('client:guard') || event === 'client:skip:error') return 'text-orange-300';
+    if (event.startsWith('client:silence') || event.includes('stuck')) return 'text-red-400';
+    if (event.startsWith('client:audioEnded') || event.startsWith('client:visibility')) return 'text-gray-500';
+    if (event.startsWith('session:')) return 'text-teal-400';
+    if (event.startsWith('autoNext:') || event.startsWith('peekNext:')) return 'text-cyan-400';
+    return 'text-gray-400';
+  };
   const [menuOpen, setMenuOpen] = useState(false);
   const currentTab = TABS.find(t => t.id === tab) || TABS[0];
 
@@ -631,6 +661,40 @@ function AdminDashboard({
               {clearingCache ? 'Recargando...' : 'Borrar caché y recargar'}
             </button>
           </div>
+        </div>
+      )}
+
+      {/* ── TAB: LOG ── */}
+      {tab === 'log' && (
+        <div className="flex-1 overflow-y-auto px-3 py-3 max-w-2xl mx-auto w-full">
+          <div className="flex justify-between items-center mb-3">
+            <p className="text-xs text-gray-600">{sessionLogs.length} eventos · más reciente arriba</p>
+            <button onClick={() => setSessionLogs([])} className="text-xs text-gray-600 hover:text-red-400 transition-colors">Limpiar</button>
+          </div>
+          {sessionLogs.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-16 gap-2">
+              <p className="text-gray-600 text-sm">Sin eventos — los logs aparecen al iniciar sesión</p>
+            </div>
+          ) : (
+            <div className="font-mono text-[10px] leading-relaxed">
+              {[...sessionLogs].reverse().map((entry, i) => {
+                const mm  = String(Math.floor((entry.elapsed || 0) / 60)).padStart(2, '0');
+                const ss  = String((entry.elapsed || 0) % 60).padStart(2, '0');
+                const skipKeys = new Set(['ts', 'elapsed', 'event']);
+                const dataStr  = Object.entries(entry)
+                  .filter(([k]) => !skipKeys.has(k))
+                  .map(([k, v]) => k + '=' + (typeof v === 'string' ? v : JSON.stringify(v)))
+                  .join(' ');
+                return (
+                  <div key={i} className="flex gap-2 py-[3px] border-b border-gray-900/60">
+                    <span className="text-gray-700 flex-shrink-0 w-9">{mm}:{ss}</span>
+                    <span className={'flex-shrink-0 w-40 truncate ' + logEventColor(entry.event)}>{entry.event}</span>
+                    <span className="text-gray-600 truncate">{dataStr}</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
