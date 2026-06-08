@@ -28,6 +28,7 @@ let bcastJoinBufMax = 0;
 let bcastBPS        = 16000; // bytes/sec, recalculated per song
 let bcastTicker     = null;
 let bcastUpstream   = null;
+let bcastGen        = 0;     // token de generación: invalida promesas de startBroadcast obsoletas
 
 function bcastTick() {
   if (bcastQueue.length === 0) return;
@@ -50,9 +51,13 @@ function startBroadcast(songId, duration) {
   if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
   if (bcastUpstream) { try { bcastUpstream.destroy(); } catch(e) {} bcastUpstream = null; }
   bcastQueue = Buffer.alloc(0); bcastJoinBuf = Buffer.alloc(0);
+  const myGen = ++bcastGen;   // si llega otra llamada antes de resolver, esta queda obsoleta
   const url = nd.streamUrl(songId);
-  axios.get(url, { responseType: 'stream', timeout: 0 })
+  axios.get(url, { responseType: 'stream', timeout: 15000 })
     .then(upstream => {
+      // Una llamada posterior a startBroadcast invalidó esta promesa: descartar
+      // este stream para no crear un segundo bcastTicker compitiendo.
+      if (myGen !== bcastGen) { try { upstream.data.destroy(); } catch(e) {} return; }
       const fileSize = parseInt(upstream.headers['content-length'] || '0');
       if (fileSize > 0 && duration > 0) {
         bcastBPS = fileSize / duration;
@@ -162,8 +167,11 @@ app.post('/api/session/info', auth.adminMiddleware, (req, res) => {
 
 app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
   const { duration } = req.body || {};
+  resetRuntimeState();   // baseline limpio: que la sesión nueva no herede estado viejo
   db.setSessionActive(true);
   io.emit('session:update', { active: true, name: db.getSessionName(), desc: db.getSessionDesc() });
+  io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
+  broadcastOnline();
   if (duration && Number(duration) > 0) {
     startSessionTimer(Date.now() + Number(duration) * 60 * 1000);
   } else {
@@ -177,14 +185,14 @@ app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
   clearSessionTimer();
   clearSongEndTimer();
   stopBroadcast();
-  pendingAutoDJ = null;
-  autoDJActive = false;
+  resetRuntimeState();   // limpia todo el estado efímero (incluye pendingAutoDJ/autoDJActive)
   db.setSessionActive(false);
   db.clearAll();
   io.emit('session:update', { active: false, name: db.getSessionName(), desc: db.getSessionDesc() });
   io.emit('queue:update', []);
   io.emit('player:update', null);
   io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
+  broadcastOnline();
   res.json({ success: true });
 });
 
@@ -589,8 +597,7 @@ function autoEndSession() {
   db.setSetting('session_end_time', '');
   clearSongEndTimer();
   stopBroadcast();
-  pendingAutoDJ = null;
-  autoDJActive = false;
+  resetRuntimeState();   // limpia todo el estado efímero (incluye pendingAutoDJ/autoDJActive)
   db.setSessionActive(false);
   db.clearAll();
   io.emit('session:update', { active: false, name: db.getSessionName(), desc: db.getSessionDesc() });
@@ -598,6 +605,7 @@ function autoEndSession() {
   io.emit('player:update',  null);
   io.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: false });
   io.emit('session:timer',  { endsAt: null });
+  broadcastOnline();
 }
 
 function startSessionTimer(endsAtMs) {
@@ -626,6 +634,20 @@ const chatRateLimit = new Map();   // socketId -> last message timestamp ms
 function broadcastOnline() {
   const list = [...onlineUsers.values()];
   io.emit('users:online', { count: list.length, users: list });
+}
+
+// Resetea TODO el estado efímero de runtime a un baseline limpio. Se llama al
+// INICIAR y al TERMINAR sesión para que cada sesión empiece/termine pristina y
+// no se filtre estado entre sesiones (causa de degradación tras horas).
+function resetRuntimeState() {
+  advanceInFlight     = false;            // limpia mutex de avance colgado
+  lastAutoAdvanceAt   = 0;                // limpia ventana de debounce de auto-avance
+  lastProgress        = { position: 0 };  // posición reportada a 0
+  pendingAutoDJ       = null;             // descarta peek-next memoizado de la sesión anterior
+  autoDJActive        = false;
+  chatMessages.length = 0;                // vacía buffer de chat (mutar array const)
+  onlineUsers.clear();
+  chatRateLimit.clear();
 }
 
 io.on('connection', socket => {
@@ -733,6 +755,11 @@ io.on('connection', socket => {
     io.emit('chat:toggle', { enabled: chatEnabled });
   });
 });
+
+// Heartbeat: latido periódico a todos los clientes. Permite al watchdog del
+// panel admin detectar de forma fiable y rápida (~20s) que el socket está
+// muerto, sin depender del ping-timeout de socket.io (que tarda ~45s).
+setInterval(() => { io.emit('heartbeat', Date.now()); }, 10000);
 
 // Recover session timer after server restart
 if (db.getSessionActive()) {

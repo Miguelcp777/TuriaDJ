@@ -857,15 +857,74 @@ export default function UnifiedView() {
   const [chatUnread,    setChatUnread]    = useState(0);
   const chatOpenRef   = useRef(false);
   const chatScrollRef = useRef(null);
+  // ── Salud de la conexión / watchdog (solo admin) ───────────────────────────
+  const lastSocketContactRef = useRef(Date.now()); // última señal de vida del socket
+  const tabStartRef          = useRef(Date.now()); // antigüedad de la pestaña (auto-recarga idle)
+  const nowPlayingRef        = useRef(null);        // espejo de nowPlaying para el intervalo
+  const sessionActiveRef     = useRef(null);        // espejo de sessionActive para el intervalo
+  const prevSessionActiveRef = useRef(null);        // detectar transición de sesión
+  const resyncAllRef         = useRef(null);        // ref a resyncAll para el watchdog
+
+  // Espejos de estado para leer desde intervalos sin re-suscribir
+  useEffect(() => { nowPlayingRef.current = nowPlaying; }, [nowPlaying]);
+  useEffect(() => { sessionActiveRef.current = sessionActive; }, [sessionActive]);
 
   // ── init after auth ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!authToken || !currentUser) return;
+
+    // Re-emite la identidad del usuario (online list)
+    const emitJoin = () => socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
+
+    // Re-sincroniza TODO el estado dinámico con el servidor. Se llama al montar,
+    // al reconectar el socket y al volver de segundo plano. Reusa la lógica de
+    // reconciliación de audio (cargar solo si el src difiere; reintentar play si
+    // está pausado) para NO reiniciar una canción que ya está sonando bien.
+    const resyncAll = () => {
+      emitJoin();
+      if (currentUser?.role !== 'admin') return; // votantes: solo re-join
+      fetch('/api/session/status').then(r => r.json()).then(({ active, name, desc }) => {
+        setSessionActive(active); setSessionName(name || ''); setSessionDesc(desc || '');
+      }).catch(() => {});
+      fetch('/api/now-playing').then(r => r.json()).then(song => {
+        if (!song) return;
+        const active = getActive();
+        const desiredSrc = '/api/stream/' + song.id;
+        if (active && (!active.src || !active.src.endsWith(desiredSrc))) {
+          cancelAnimationFrame(crossfadeRaf.current);
+          fadeScheduled.current = false;
+          setNowPlaying(song);
+          loadAndPlay(song);
+        } else if (active && active.paused) {
+          active.play().then(() => setIsPlaying(true)).catch(() => {});
+        }
+      }).catch(() => {});
+      authFetch('/api/queue').then(r => r.json()).then(setQueue).catch(() => {});
+      fetch('/api/autodj/status').then(r => r.json())
+        .then(({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); }).catch(() => {});
+    };
+    resyncAllRef.current = resyncAll;   // exponer al watchdog
+
     socket.on('queue:update',   (q) => setQueue(q));
     socket.on('session:update', ({ active, name, desc }) => {
+      const prev = prevSessionActiveRef.current;
+      prevSessionActiveRef.current = active;
       setSessionActive(active);
       if (name !== undefined) setSessionName(name || '');
       if (desc  !== undefined) setSessionDesc(desc  || '');
+      if (active === false) {
+        // Sesión terminada → reset total a idle (mismo teardown que player:update null)
+        cancelAnimationFrame(crossfadeRaf.current);
+        fadeScheduled.current = false;
+        [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
+        activeRef.current = 'A';
+        setIsPlaying(false); setCurrentTime(0); setDuration(0);
+        setVoterListening(false);
+        setNowPlaying(null); setQueue([]); setChatMessages([]); setAutoDJActive(false);
+      } else if (active === true && prev === false) {
+        // Sesión (re)iniciada tras estar cerrada → re-sincronizar todo
+        resyncAll();
+      }
     });
     socket.on('player:update', (song) => {
       setNowPlaying(song);
@@ -895,29 +954,24 @@ export default function UnifiedView() {
       }
     });
     socket.on('player:progress', (data) => {
+      lastSocketContactRef.current = Date.now(); // señal de vida del socket
       if (data && !getActive()?.src) {
         setCurrentTime(data.position || 0); setDuration(data.duration || 0);
       }
     });
-    fetch('/api/session/status').then(r => r.json()).then(({ active, name, desc }) => {
-      setSessionActive(active); setSessionName(name || ''); setSessionDesc(desc || '');
-    }).catch(() => setSessionActive(false));
-    fetch('/api/now-playing').then(r => r.json()).then(song => {
-      setNowPlaying(song);
-      if (song && audioA.current) { activeRef.current = 'A'; audioA.current.src = '/api/stream/' + song.id; }
-    });
-    authFetch('/api/queue').then(r => r.json()).then(setQueue);
+    socket.on('heartbeat', () => { lastSocketContactRef.current = Date.now(); }); // latido del servidor
+    socket.on('autodj:update', ({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); });
+    socket.on('users:online', (data) => setOnlineUsers(data));
+    // Carga inicial: session/status + now-playing + queue + autodj + user:join
+    resyncAll();
     authFetch('/api/playlists').then(r => r.json()).then(setPlaylists).catch(() => {});
     authFetch('/api/queue/my-votes').then(r => r.json())
       .then(ids => setVotedSongs(new Set(ids))).catch(() => {});
-    socket.on('autodj:update', ({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); });
-    fetch('/api/autodj/status').then(r => r.json()).then(({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); }).catch(() => {});
-    socket.on('users:online', (data) => setOnlineUsers(data));
     socket.on('player:silence-config', ({ threshold, seconds }) => setSilenceConfig({ threshold, seconds }));
     socket.on('player:crossfade-config', ({ ms }) => { if (ms > 0) setCrossfadeConfig({ ms }); });
     socket.on('chat:history', ({ messages, enabled }) => { setChatMessages(messages); setChatEnabled(enabled); });
     socket.on('chat:message', msg => {
-      setChatMessages(prev => [...prev, msg]);
+      setChatMessages(prev => { const n = [...prev, msg]; return n.length > 100 ? n.slice(n.length - 100) : n; });
       if (!chatOpenRef.current) setChatUnread(prev => prev + 1);
     });
     socket.on('chat:toggle', ({ enabled }) => setChatEnabled(enabled));
@@ -933,35 +987,21 @@ export default function UnifiedView() {
         else if (action === 'volume' && value !== undefined) audio.volume = value;
       });
     }
-    // Emit user:join now and re-emit on every reconnect
-    const emitJoin = () => socket.emit('user:join', { username: currentUser.username, role: currentUser.role });
-    emitJoin();
-    socket.on('connect', emitJoin);
+    // Al reconectar el socket (típico en móvil tras background): re-identificar
+    // y re-sincronizar todo el estado, y marcar señal de vida.
+    const onConnect = () => { lastSocketContactRef.current = Date.now(); resyncAll(); };
+    socket.on('connect', onConnect);
+    socket.on('disconnect', () => { /* lastSocketContactRef conserva el último contacto */ });
 
     // ── Sincronización al volver del background ───────────────────────────
-    // En móvil/PWA, cuando la pestaña está en background:
-    //   - Los timers se throttean a >1s
-    //   - El audio puede pararse al terminar la canción y no avanzar (la
-    //     llamada a play() de la siguiente canción es bloqueada por el
-    //     navegador o el src nunca se actualiza)
-    // Al volver al foreground, comprobamos /api/now-playing y si la canción
-    // que estaba sonando ya no coincide, cargamos la nueva.
+    // En móvil/PWA la pestaña se manda a background repetidamente: el socket se
+    // cae, los timers se throttean y el estado se desfasa. Al volver a primer
+    // plano re-sincronizamos TODO (sesión, now-playing, cola, autodj), no solo
+    // la canción. resyncAll reusa la reconciliación de audio (no reinicia una
+    // canción que ya suena bien).
     const onAdminVisibility = () => {
       if (document.hidden || currentUser?.role !== 'admin') return;
-      fetch('/api/now-playing').then(r => r.json()).then(song => {
-        if (!song) return;
-        const active = getActive();
-        const desiredSrc = '/api/stream/' + song.id;
-        if (active && (!active.src || !active.src.endsWith(desiredSrc))) {
-          console.log('[UnifiedView] visibility sync: load', song.title);
-          cancelAnimationFrame(crossfadeRaf.current);
-          fadeScheduled.current = false;
-          loadAndPlay(song);
-        } else if (active && active.paused) {
-          // Mismo src pero pausado por autoplay policy: reintentar play()
-          active.play().then(() => setIsPlaying(true)).catch(() => {});
-        }
-      }).catch(() => {});
+      resyncAll();
     };
     document.addEventListener('visibilitychange', onAdminVisibility);
     socket.on('spooty:ready', ({ message }) => { setSpootyOpen(false); setSpootyStatus('idle'); setSpootyUrl(''); showToast('✅ ' + message, 7000); });
@@ -971,7 +1011,7 @@ export default function UnifiedView() {
       socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online');
       socket.off('player:silence-config'); socket.off('player:crossfade-config');
       socket.off('player:cmd'); socket.off('spooty:ready'); socket.off('spooty:error');
-      socket.off('connect', emitJoin); socket.off('chat:history'); socket.off('chat:message');
+      socket.off('connect', onConnect); socket.off('disconnect'); socket.off('heartbeat'); socket.off('chat:history'); socket.off('chat:message');
       socket.off('chat:toggle'); socket.off('chat:clear'); socket.off('session:timer');
       document.removeEventListener('visibilitychange', onAdminVisibility);
     };
@@ -982,6 +1022,50 @@ export default function UnifiedView() {
     document.addEventListener('mousedown', h);
     return () => document.removeEventListener('mousedown', h);
   }, []);
+
+  // ── Watchdog de auto-recuperación (solo admin) ─────────────────────────────
+  // En sesiones de muchas horas el panel admin en móvil puede quedar con el
+  // socket muerto o el estado desfasado. Cada 12s, con la pestaña visible:
+  //   - socket caído >20s → reconectar + resync por HTTP (independiente del socket)
+  //   - socket caído >60s → recargar la página (último recurso)
+  //   - pestaña con >6h de vida y en momento idle → recarga preventiva
+  // Nunca recarga con la pestaña oculta; backoff de 90s evita bucles de recarga.
+  useEffect(() => {
+    if (!currentUser || currentUser.role !== 'admin') return;
+
+    const guardedReload = (reason) => {
+      if (document.hidden) return;
+      const last = Number(localStorage.getItem('jv_last_reload') || 0);
+      if (Date.now() - last < 90000) return; // backoff anti-bucle
+      localStorage.setItem('jv_last_reload', String(Date.now()));
+      console.warn('[watchdog] recargando:', reason);
+      window.location.reload();
+    };
+
+    const tick = () => {
+      if (document.hidden) return;
+      const now = Date.now();
+      // Señal primaria: tiempo sin contacto del servidor (heartbeat cada 10s).
+      // NO usamos socket.connected porque tarda ~45s (ping-timeout) en reflejar
+      // un corte real; el heartbeat lo detecta en ~20s.
+      const sinceContact = now - lastSocketContactRef.current;
+
+      if (sinceContact > 20000) {
+        console.warn('[watchdog] socket caído', Math.round(sinceContact / 1000) + 's — reconectar + resync');
+        try { if (!socket.connected) socket.connect(); } catch (e) {}
+        resyncAllRef.current?.(); // resync por HTTP, independiente del socket
+      }
+      if (sinceContact > 60000) guardedReload('socket-dead');
+
+      // Recarga preventiva por antigüedad, solo si no hay nada sonando / sesión cerrada
+      if (now - tabStartRef.current > 6 * 3600 * 1000 && (!nowPlayingRef.current || !sessionActiveRef.current)) {
+        guardedReload('max-age');
+      }
+    };
+
+    const id = setInterval(tick, 12000);
+    return () => clearInterval(id);
+  }, [currentUser]);
 
   useEffect(() => { chatOpenRef.current = chatOpen; if (chatOpen) setChatUnread(0); }, [chatOpen]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [chatMessages, chatOpen]);
