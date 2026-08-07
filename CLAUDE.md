@@ -290,7 +290,8 @@ Y en `onVisibility`, si `getActive()?.paused === false` (está "playing" según 
 - **`bcastJoinBufMax = 0`** en inicio — los clientes que conectan antes del primer `startBroadcast` no reciben join buffer; esto es correcto pero puede sonar a silencio breve
 - **SQLite es síncrono** — todas las operaciones de `db.js` bloquean el event loop de Node. Para cargas altas, considerar WAL mode: `db.pragma('journal_mode = WAL')`
 - **Servicio systemd en producción**: el servicio se llama `turiadj.service` (NO `jukevote.service` — ese era un duplicado antiguo que se ha eliminado). Cwd: `/opt/jukevote`. `Restart=always` con `RestartSec=5`. Para reiniciar tras deploy: `sudo systemctl restart turiadj.service`.
-- **Crossfade del servidor para voters (`/api/live`)**: NO está implementado. Se intentó con ffmpeg `acrossfade` pero rompía el bitstream MP3 del decoder del cliente (`mp3float: Header missing`) y ffmpeg tardaba ~5s en arrancar. Los voters escuchan un corte abrupto entre canciones — limitación arquitectónica conocida. El crossfade solo funciona en cliente con dual `<audio>` (PlayerView y UnifiedView admin).
+- **Crossfade del servidor para voters (`/api/live`)**: sigue SIN implementar (el solapamiento solo existe en cliente, con dual `<audio>`: PlayerView y UnifiedView admin). Lo que SÍ se arregló (2026-08-07) es el **silencio** entre canciones: hoy la transición es un corte limpio *gapless*, sin hueco mudo. Ver la sección "Transiciones sin silencio". El intento antiguo con ffmpeg `acrossfade` fracasó por dos razones ya entendidas: el muxer MP3 escribe ID3v2+Xing al inicio (de ahí `mp3float: Header missing`, se evita con `-write_xing 0 -id3v2_version 0`), y el arranque de ~5s deja de importar porque `player:peek-next` avisa con ~90s de antelación.
+- **⚠️ Los tags ID3v2 son audio-time en el broadcast**: el 99,6% de la biblioteca lleva carátula incrustada (45 KB de media, hasta 263 KB). Como `/api/live` dosifica bytes a ritmo de reproducción, **cada KB de tag consume tiempo real de emisión**. Cualquier código que meta bytes en el broadcast DEBE saltar el tag primero (`findAudioStart`). Ojo: no basta con buscar el sync `0xFFEx`, porque el JPEG de la carátula puede imitar cabeceras — hay que saltar el tag por su longitud declarada (syncsafe) y solo después buscar el frame.
 
 ---
 
@@ -407,10 +408,48 @@ Resultado: ✅ AFTER WAKE: src changed to new song / audio is PLAYING
 
 ---
 
+## Transiciones sin silencio en `/api/live` (✅ 2026-08-07)
+
+Los voters oían ~2-3 s de silencio en **cada** cambio de canción. No era un problema de red ni del cliente.
+
+**Causa dominante — el tag ID3v2.** El 99,6% de las canciones lleva carátula incrustada (45 KB de media). El broadcast emite a ritmo de reproducción (`bcastBPS ≈ 17 KB/s`), así que transmitir el tag gastaba **2,82 s de media** (mediana 2,55 s; **peor caso 15,95 s** con un tag de 263 KB) sin entregar un solo frame de audio. El admin no lo sufre: su navegador descarga el fichero entero a toda velocidad y salta el tag al instante.
+
+**Causas secundarias.** `startBroadcast` paraba el ticker y vaciaba la cola *antes* de la petición asíncrona a Navidrome; y el corte por número de bytes partía frames, provocando `Header missing` en cada transición.
+
+### Motor actual
+| Pieza | Función |
+|---|---|
+| `findAudioStart` | Salta el ID3v2 por longitud declarada y luego busca el sync |
+| `makeSink`/`sinkFeed` | Acumulador que descarta todo lo previo al primer frame |
+| `openSource` | Abre un stream de Navidrome hacia un sink, sin tocar la emisión |
+| `prefetchBroadcast` | Descarga la siguiente canción por adelantado (desde `peek-next` y tras cada avance) |
+| `frameAlignedCut` | Emite siempre frames completos → el empalme nunca parte una trama |
+
+El ticker **ya no se para** en los cambios de canción, y `bcastBPS` se calcula sobre bytes de audio (sin el tag).
+
+### Cómo medirlo (importante)
+`silencedetect` sobre una captura **NO sirve**: el tag no es audio, ffmpeg lo salta al abrir el fichero y se pierde la información de temporización. La métrica correcta es **segundos de audio entregados por segundo de reloj**, parseando los frames según llegan; si cae a ~0, eso es el silencio real.
+
+Verificado A/B con dos instancias aisladas y misma carga (5 transiciones forzadas):
+
+| | Antes | Después |
+|---|---|---|
+| Ventanas de hambre (<0,35 s audio/s) | **9** (las 9 junto a un cambio) | **0** |
+| Bytes que no eran audio | 9,8% | **0%** |
+| Errores de decodificación | `Header missing` | **ninguno** |
+
+También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.jsx`): el bucle nunca llamaba a `sb.remove()`, así que el `SourceBuffer` crecía sin límite y al agotar la cuota el `catch` silenciaba el error y el stream moría solo. Afecta a Android/Chrome; iPhone Safari no implementa `MediaSource` y usa la rama alternativa.
+
+---
+
 ## Historial de cambios relevantes
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-08-07 | **Transiciones sin silencio en el stream de voters** — causa: los tags ID3v2 (45 KB de media) se transmitían a ritmo de reproducción, gastando 2,82 s de media por canción. Ahora se saltan; además precarga de la siguiente canción, ticker que no se detiene y emisión alineada a frame. + fix de la fuga de MSE en el voter. Verificado A/B: 9 → 0 ventanas de silencio. |
+| 2026-08-07 | **Seguridad P0** — producción no definía `JWT_SECRET`, así que usaba el fallback hardcodeado de `auth.js`, publicado en el repo (público) y con el sitio expuesto a Internet; el admin conservaba la contraseña por defecto `admin`/`admin` y Socket.IO aceptaba `origin: '*'`. Corregido: secreto obligatorio (aborta si falta), `ALLOWED_ORIGIN` por lista, seed de admin desde `ADMIN_PASSWORD`. |
+| 2026-08-07 | **Fix del join buffer para late joiners** — el buffer rodante empezaba a media trama y el decodificador no sincronizaba: quien entraba a mitad de canción no oía nada hasta el siguiente tema. `parseMp3Header`/`findMp3FrameStart` (Layer III + encadenado de 2 frames para descartar falsos positivos). |
+| 2026-08-07 | **Fix de la posición en el voter** — al pulsar Escuchar, el `<audio>` cargaba `/api/live` (currentTime desde 0, duration Infinity) y `handleTimeUpdate` emitía eso por `player:progress`, sobrescribiendo `lastProgress` global y corrompiendo la posición de la sesión para todos. Ahora el voter no emite y toma la posición del servidor. |
 | 2026-06-07 | **Robustez de sesión en eventos largos** — `resetRuntimeState()` en inicio/fin de sesión (servidor), heartbeat cada 10s, watchdog de auto-recuperación en el panel admin (`resyncAll` en reconexión/foreground; recarga con backoff si el socket lleva >60s muerto), trim de chat a 100, `bcastGen`+timeout en broadcast. Solo admin; PlayerView intacto. Verificado E2E. |
 | 2026-06-05 | **Fix crossfade en AutoDJ (corte seco → solapamiento real)** — la siguiente canción de AutoDJ no se precargaba (la cola está vacía y se decidía en el último momento). Nuevo `pickAutoDJSong()` + `pendingAutoDJ` + socket `player:peek-next`: el cliente consulta la siguiente ~90s antes y la precarga; `advanceQueue` reproduce esa misma. `doImmediateSwitch` usa el preload (silencio/skip gapless). Verificado con 3 E2E (solapamiento 4s real, silencio→cambio, preload readyState 4). |
 | 2026-06-03 | **Fix stall intermitente "a veces no avanza"** — causa raíz: ACK de `player:auto-next` perdido dejaba el reproductor parado (el `player:update` del servidor era ignorado por el mutex y nada re-disparaba). Ahora el guard (6s) y `handleAudioEnded` recuperan vía `syncWithServer()`. + fix doble-crossfade en `doCrossfade` (flag `started`) + debounce 2s anti doble-avance para avances automáticos en `advanceQueue({auto})`. Verificado con 3 tests E2E en Chromium. |
