@@ -906,6 +906,9 @@ export default function UnifiedView() {
   const [sessionEndTime, setSessionEndTime]   = useState(null);
   const [voterListening, setVoterListening] = useState(false);
   const [voterLoading,   setVoterLoading]   = useState(false);
+  // Espejo en ref: el efecto del socket tiene deps [authToken, currentUser] y no
+  // se re-registra al cambiar voterListening — sus handlers leerían un valor obsoleto.
+  const voterListeningRef = useRef(false);
   const [installPrompt,  setInstallPrompt]  = useState(null);
   const [showInstallBanner, setShowInstallBanner] = useState(false);
   const [autoDJEnabled, setAutoDJEnabled] = useState(false);
@@ -1019,7 +1022,11 @@ export default function UnifiedView() {
     });
     socket.on('player:progress', (data) => {
       lastSocketContactRef.current = Date.now(); // señal de vida del socket
-      if (data && !getActive()?.src) {
+      // El voter escuchando el stream en vivo tambien necesita la posicion del
+      // servidor: antes el guard `!src` la bloqueaba en cuanto pulsaba Escuchar
+      // (se asignaba el src del stream) y la barra se congelaba en el minuto de
+      // entrada, sin avanzar nunca.
+      if (data && (voterListeningRef.current || !getActive()?.src)) {
         setCurrentTime(data.position || 0); setDuration(data.duration || 0);
       }
     });
@@ -1131,6 +1138,7 @@ export default function UnifiedView() {
     return () => clearInterval(id);
   }, [currentUser]);
 
+  useEffect(() => { voterListeningRef.current = voterListening; }, [voterListening]);
   useEffect(() => { chatOpenRef.current = chatOpen; if (chatOpen) setChatUnread(0); }, [chatOpen]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [chatMessages, chatOpen]);
 
@@ -1309,6 +1317,12 @@ export default function UnifiedView() {
     if (which !== activeRef.current) return;
     const audio = getActive();
     if (!audio) return;
+    // Voter escuchando /api/live: su currentTime arranca en 0 y su duration es
+    // Infinity (stream sin fin), asi que NO refleja la posicion de la cancion.
+    // Emitirlo sobrescribiria lastProgress en el servidor y se retransmitiria a
+    // todos los clientes, corrompiendo la posicion de la sesion entera. La
+    // posicion del voter llega por el socket 'player:progress' (ver efecto).
+    if (voterListeningRef.current) return;
     const ct  = audio.currentTime;
     const dur = audio.duration || 0;
     setCurrentTime(ct);
