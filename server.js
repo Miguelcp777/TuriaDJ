@@ -58,9 +58,13 @@ let sessionStartTime = 0;
 // llegar lo más cerca posible de `target`. Emitir media trama hace que el
 // decodificador del oyente escupa "Header missing" — y al cambiar de canción
 // pasaba en CADA transición, porque el corte caía en cualquier byte.
-function frameAlignedCut(buf, target) {
+// Corta frames completos hasta cubrir `targetMs` de audio. El presupuesto va en
+// MILISEGUNDOS DE AUDIO, no en bytes: `fileSize/duration` es una estimacion que
+// con VBR se desvia, y emitir de mas agota la cancion antes de tiempo (medido:
+// 110 s de audio despachados en 85 s, y luego ~25 s mudos hasta el avance).
+function frameAlignedCut(buf, targetMs) {
   let off = 0, ms = 0;
-  while (off < target) {
+  while (ms < targetMs) {
     const h = parseMp3Header(buf, off);
     if (!h) break;                          // desincronizado
     if (off + h.len > buf.length) break;    // frame aún incompleto: esperar datos
@@ -98,8 +102,13 @@ function bcastTick() {
     return;
   }
 
-  const bytesPerTick = Math.ceil(bcastBPS * TICK_MS / 1000);
-  let cut = frameAlignedCut(src.sink.out, bytesPerTick);
+  // Reloj de audio: se emite lo que falte para que el audio despachado alcance al
+  // tiempo transcurrido. Asi la cancion dura exactamente lo que dura, sin adelantos.
+  if (!src.clockStart) src.clockStart = Date.now() - (src.emittedMs || 0);
+  let owedMs = (Date.now() - src.clockStart) - (src.emittedMs || 0);
+  if (owedMs <= 0) return;
+  if (owedMs > 2000) owedMs = 2000;         // techo: no soltar una rafaga tras un parón
+  let cut = frameAlignedCut(src.sink.out, owedMs);
   if (cut.bytes === 0) {
     // O falta buffer para completar el frame (esperar), o hemos perdido el sync
     // y hay basura delante: en ese caso resincronizar descartándola.
@@ -107,7 +116,7 @@ function bcastTick() {
     const resync = findMp3FrameStart(src.sink.out);
     if (resync <= 0) { if (src.isBridge) finishBridge(); return; }
     src.sink.out = src.sink.out.slice(resync);
-    cut = frameAlignedCut(src.sink.out, bytesPerTick);
+    cut = frameAlignedCut(src.sink.out, owedMs);
     if (cut.bytes === 0) return;
   }
   const chunk  = src.sink.out.slice(0, cut.bytes);
@@ -337,10 +346,12 @@ function finishBridge() {
   if (!after || !after.src) return;
   const src = after.src;
   if (src.sink.synced && src.sink.out.length) src.sink.out = skipFrames(src.sink.out, after.skipMs);
-  src.skipPendingMs = after.skipMs;      // por si aún no habia sincronizado
-  bcastSource = src;
-  bcastSongId = src.songId;
-  bcastBPS    = src.bps;
+  if (!src.sink.synced) src.skipPendingMs = after.skipMs;  // saltar al sincronizar
+  bcastSource    = src;
+  bcastSongId    = src.songId;
+  src.emittedMs  = 0;
+  src.clockStart = Date.now();
+  bcastBPS       = src.bps;
   slog('broadcast:bridgeDone', { id: String(src.songId).slice(0,8) });
   if (src.songId) detectAudioEnd(src, src.songId, src.durationSec || 0);
 }
@@ -418,10 +429,13 @@ function prefetchBroadcast(songId, duration) {
 
 function startBroadcast(songId, duration) {
   slog('broadcast:start', { id: songId.slice(0, 8), dur: duration });
-  // Idempotencia: cuando la canción trae silencio de cola, el crossfade arranca
-  // por su cuenta ANTES de que el cliente pida el avance. Si ya estamos emitiendo
-  // esta canción — o mezclando hacia ella — no hay que reiniciarla desde cero.
-  if (bcastSongId === songId && bcastSource && !bcastSource.failed) return;
+  // Idempotencia: se ignora el arranque solo si esa misma canción sigue VIVA en
+  // emisión (o estamos mezclando hacia ella). Si la fuente ya se agotó hay que
+  // reiniciar de verdad — un guard que mirase únicamente el id dejaba el audio
+  // mudo cuando se pedía relanzar la canción en curso, y AutoDJ elige al azar,
+  // así que puede repetir canción.
+  if (bcastSongId === songId && bcastSource && !bcastSource.failed &&
+      (bcastSource.isBridge || bcastSource.sink.out.length > 0 || bcastSource.upstream)) return;
   // El avance del cliente llega ~5 s antes del final. Si la mezcla para
   // justamente esta canción ya está lista, ese avance debe DISPARAR el crossfade
   // en vez de cancelarlo con un corte seco.
@@ -455,6 +469,8 @@ function startBroadcast(songId, duration) {
                               try { prev.upstream?.destroy(); } catch(e) {} }
   bcastSource     = src;
   bcastSongId     = songId;
+  src.emittedMs   = 0;
+  src.clockStart  = Date.now();   // el reloj de audio arranca al adoptar la fuente
   bcastJoinBuf    = Buffer.alloc(0);
   bcastBPS        = src.bps;
   bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS);
