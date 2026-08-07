@@ -38,6 +38,8 @@ let bcastGen        = 0;     // token de generación: invalida promesas de start
 let bcastSongId     = null;  // canción actualmente en emisión
 let bcastSource     = null;  // fuente en emisión (ver openSource)
 let bcastPrefetch   = null;  // siguiente canción ya descargándose (ver prefetchBroadcast)
+let bcastBridge     = null;  // segmento de crossfade A→B renderizado por ffmpeg
+let bcastAfterBridge= null;  // { src, skipMs } canción que retoma tras la mezcla
 
 // ── Log de diagnóstico por sesión ────────────────────────────────────────────
 // Se resetea en cada inicio/fin de sesión. Registra eventos clave del motor de
@@ -51,14 +53,27 @@ let sessionStartTime = 0;
 // decodificador del oyente escupa "Header missing" — y al cambiar de canción
 // pasaba en CADA transición, porque el corte caía en cualquier byte.
 function frameAlignedCut(buf, target) {
-  let off = 0;
+  let off = 0, ms = 0;
   while (off < target) {
     const h = parseMp3Header(buf, off);
     if (!h) break;                          // desincronizado
     if (off + h.len > buf.length) break;    // frame aún incompleto: esperar datos
-    off += h.len;
+    off += h.len; ms += h.ms;
   }
-  return off;
+  return { bytes: off, ms };
+}
+
+// Descarta los primeros `ms` de audio de un buffer, en frontera de frame. Se usa
+// tras el bridge: la cabeza de B ya ha sonado dentro de la mezcla, así que hay
+// que reanudar B por donde se quedó y no desde el principio.
+function skipFrames(buf, ms) {
+  let off = 0, acc = 0;
+  while (acc < ms) {
+    const h = parseMp3Header(buf, off);
+    if (!h || off + h.len > buf.length) break;
+    off += h.len; acc += h.ms;
+  }
+  return buf.slice(off);
 }
 
 function bcastTick() {
@@ -67,20 +82,34 @@ function bcastTick() {
   // ID3): no hay nada que emitir todavía.
   if (!src || !src.sink.synced || src.sink.out.length === 0) return;
   if (src.bps) { bcastBPS = src.bps; bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS); }
+
+  // ¿Toca ya el crossfade? Se decide con el reloj de audio REALMENTE emitido,
+  // no con el del cliente: así el punto de mezcla cae donde acaba el audio útil
+  // de la canción (sin su silencio de cola) y no donde el cliente decida.
+  if (!src.isBridge && bcastBridge && bcastBridge.ready && !bcastBridge.failed &&
+      bcastBridge.startMs && src.emittedMs >= bcastBridge.startMs) {
+    enterBridge();
+    return;
+  }
+
   const bytesPerTick = Math.ceil(bcastBPS * TICK_MS / 1000);
   let cut = frameAlignedCut(src.sink.out, bytesPerTick);
-  if (cut === 0) {
+  if (cut.bytes === 0) {
     // O falta buffer para completar el frame (esperar), o hemos perdido el sync
     // y hay basura delante: en ese caso resincronizar descartándola.
-    if (src.sink.out.length < 4096) return;
+    if (src.sink.out.length < 4096) { if (src.isBridge) finishBridge(); return; }
     const resync = findMp3FrameStart(src.sink.out);
-    if (resync <= 0) return;
+    if (resync <= 0) { if (src.isBridge) finishBridge(); return; }
     src.sink.out = src.sink.out.slice(resync);
     cut = frameAlignedCut(src.sink.out, bytesPerTick);
-    if (cut === 0) return;
+    if (cut.bytes === 0) return;
   }
-  const chunk  = src.sink.out.slice(0, cut);
-  src.sink.out = src.sink.out.slice(cut);
+  const chunk  = src.sink.out.slice(0, cut.bytes);
+  src.sink.out = src.sink.out.slice(cut.bytes);
+  src.emittedMs = (src.emittedMs || 0) + cut.ms;
+  // El bridge es un buffer finito: al agotarlo hay que dar paso a la canción
+  // siguiente, ya precargada y adelantada los segundos que duró la mezcla.
+  if (src.isBridge && src.sink.out.length === 0) setImmediate(finishBridge);
   // Rolling join buffer: keep last JOIN_BUF_SECS of audio for late joiners
   bcastJoinBuf = Buffer.concat([bcastJoinBuf, chunk]);
   if (bcastJoinBuf.length > bcastJoinBufMax && bcastJoinBufMax > 0)
@@ -122,7 +151,8 @@ function parseMp3Header(buf, i) {
   const spf = ver === 3 ? 1152 : 576;       // samples/frame Layer III
   const len = Math.floor(spf / 8 * bitrate / srate) + pad;
   if (len < 24) return null;
-  return { len, srate };
+  const ch = ((buf[i + 3] >> 6) & 0x03) === 3 ? 1 : 2;   // 11 = mono
+  return { len, srate, spf, ch, ms: spf * 1000 / srate };
 }
 
 function findMp3FrameStart(buf) {
@@ -173,6 +203,11 @@ function sinkFeed(sink, chunk) {
     sink.out = sink.pre.slice(start);
     sink.pre = Buffer.alloc(0);
     sink.synced = true;
+    // Formato real del stream: el bridge del crossfade debe generarse con estos
+    // mismos parámetros, o el decodificador del oyente ve un cambio de config
+    // de códec a mitad de stream y se rompe.
+    const h = parseMp3Header(sink.out, 0);
+    if (h) { sink.srate = h.srate; sink.ch = h.ch; }
   } else if (sink.pre.length > 4 * 1024 * 1024) {
     // Salvaguarda: fichero raro sin sync reconocible. Emitir tal cual antes que
     // quedarnos callados para siempre.
@@ -180,11 +215,149 @@ function sinkFeed(sink, chunk) {
   }
 }
 
+// ── Crossfade en el servidor (para los oyentes de /api/live) ─────────────────
+// El crossfade de cliente (dual <audio>) solo lo tienen el admin y PlayerView.
+// Los voters recibian un corte seco, y si la cancion traia silencio de cola se
+// oia ese silencio entero. Aqui se resuelve en dos pasos:
+//   1. detectAudioEnd: localiza donde acaba el audio DE VERDAD (sin el silencio
+//      final), para no cruzar silencio con silencio.
+//   2. renderBridge: ffmpeg mezcla la cola de A con la cabeza de B y devuelve un
+//      MP3 que se emite en medio. Se genera con antelacion (peek-next avisa ~90 s
+//      antes), asi que el arranque de ffmpeg no se nota.
+// Todo degrada con seguridad: si algo falla se hace el corte limpio de siempre.
+const BRIDGE_MAX_BYTES = 6 * 1024 * 1024;
+
+function detectAudioEnd(src, songId, durationSec) {
+  if (!durationSec || durationSec < 10) return;
+  const ff = spawn('ffmpeg', ['-v','info','-i', nd.streamUrl(songId),
+                              '-af','silencedetect=n=-50dB:d=0.6','-f','null','-']);
+  let err = '';
+  ff.stderr.on('data', d => { err += d.toString(); if (err.length > 65536) err = err.slice(-65536); });
+  ff.on('error', () => {});
+  ff.on('close', () => {
+    if (src.cancelled) return;
+    // Emparejar los bloques en orden. El silencio de cola es el ultimo bloque que
+    // o bien no tiene cierre (llega a EOF) o bien cierra justo al final del
+    // fichero — este segundo caso es el habitual y se me escapaba al principio.
+    const blocks = []; let open = null;
+    for (const m of err.matchAll(/silence_(start|end):\s*([\d.]+)/g)) {
+      const t = parseFloat(m[2]);
+      if (m[1] === 'start') { open = { start: t, end: null }; blocks.push(open); }
+      else if (open) { open.end = t; open = null; }
+    }
+    let endMs = durationSec * 1000;
+    const last = blocks[blocks.length - 1];
+    if (last && last.start > durationSec * 0.5) {
+      const reachesEof = last.end === null || last.end >= durationSec - 0.35;
+      if (reachesEof && durationSec - last.start > 0.7) endMs = last.start * 1000;
+    }
+    src.audioEndMs = endMs;
+    if (endMs < durationSec * 1000 - 100)
+      slog('broadcast:tailSilence', { id: songId.slice(0,8), cut: +((durationSec - endMs/1000).toFixed(1)) });
+    maybeRenderBridge();
+  });
+  setTimeout(() => { try { ff.kill('SIGKILL'); } catch(e) {} }, 45000);
+}
+
+// Genera el segmento de mezcla A→B. `startSec` es el punto de A donde arranca.
+function renderBridge(songA, startSec, songB, secs, srate, ch) {
+  const gen = bcastGen;
+  const bridge = { ready: false, buf: Buffer.alloc(0), gen, songB, secs };
+  const f = `[0:a]afade=t=out:st=0:d=${secs}[a];[1:a]afade=t=in:st=0:d=${secs}[b];` +
+            `[a][b]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[out]`;
+  const ff = spawn('ffmpeg', ['-v','error',
+    '-ss', String(startSec), '-t', String(secs), '-i', nd.streamUrl(songA),
+    '-t', String(secs), '-i', nd.streamUrl(songB),
+    '-filter_complex', f,
+    // -map explicito + -vn: las canciones llevan la caratula incrustada y ffmpeg
+    // la mapea sola como stream de video. Con el ID3v2 desactivado en la salida
+    // no puede escribirla, falla la cabecera y no produce NI UN byte.
+    '-map', '[out]', '-vn',
+    '-ar', String(srate), '-ac', String(ch), '-c:a', 'libmp3lame', '-b:a', '192k',
+    // Sin ID3 ni frame Xing: insertados a mitad de stream, el decodificador ve un
+    // tag donde esperaba audio y da "Header missing" (asi fallo el intento viejo).
+    '-f','mp3','-write_xing','0','-id3v2_version','0','-map_metadata','-1','-flags','+bitexact','-']);
+  const chunks = []; let n = 0, errTxt = '';
+  ff.stdout.on('data', d => { n += d.length; if (n <= BRIDGE_MAX_BYTES) chunks.push(d); });
+  ff.stderr.on('data', d => { if (errTxt.length < 2048) errTxt += d.toString(); });
+  ff.on('error', e => { bridge.failed = true; slog('broadcast:bridgeFail', { why: 'spawn ' + e.message }); });
+  ff.on('close', code => {
+    if (code !== 0 || !chunks.length) {
+      bridge.failed = true;
+      slog('broadcast:bridgeFail', { code, bytes: n, err: errTxt.trim().split('\n')[0] || '' });
+      return;
+    }
+    const raw = Buffer.concat(chunks);
+    const start = findAudioStart(raw);
+    if (start < 0) { bridge.failed = true; slog('broadcast:bridgeFail', { why: 'sin frame valido' }); return; }
+    bridge.buf = raw.slice(start);
+    bridge.ready = true;
+    slog('broadcast:bridgeReady', { kb: Math.round(bridge.buf.length/1024), secs });
+  });
+  setTimeout(() => { try { ff.kill('SIGKILL'); } catch(e) {} }, 60000);
+  return bridge;
+}
+
+// Conmuta la emisión al segmento de mezcla ya renderizado. La canción A se
+// abandona aquí (su cola era silencio o estaba a punto de acabarse) y B queda
+// esperando en bcastAfterBridge.
+function enterBridge() {
+  const b = bcastBridge;
+  if (!b || !b.ready || !bcastPrefetch || bcastPrefetch.songId !== b.songB) { bcastBridge = null; return; }
+  slog('broadcast:crossfade', { secs: b.secs, kb: Math.round(b.buf.length/1024) });
+  const prev = bcastSource;
+  bcastAfterBridge = { src: bcastPrefetch, skipMs: b.secs * 1000 };
+  // Desde ya la emisión "es" la canción siguiente: si el cliente pide el avance
+  // mientras suena la mezcla, el guard de startBroadcast lo ignora en vez de
+  // reiniciar la canción y cortar el crossfade a la mitad.
+  bcastSongId   = b.songB;
+  bcastPrefetch = null;
+  bcastBridge   = null;
+  if (prev) { prev.cancelled = true; try { prev.upstream?.destroy(); } catch(e) {} }
+  bcastSource = {
+    songId: prev ? prev.songId : null,
+    isBridge: true,
+    bps: prev ? prev.bps : bcastBPS,
+    emittedMs: 0,
+    sink: { pre: Buffer.alloc(0), synced: true, out: b.buf, skipped: 0,
+            srate: prev?.sink.srate, ch: prev?.sink.ch }
+  };
+}
+
+// El bridge se ha agotado: dar paso a B, saltando la parte que ya sonó mezclada.
+function finishBridge() {
+  const after = bcastAfterBridge;
+  bcastAfterBridge = null;
+  if (!after || !after.src) return;
+  const src = after.src;
+  if (src.sink.synced && src.sink.out.length) src.sink.out = skipFrames(src.sink.out, after.skipMs);
+  src.skipPendingMs = after.skipMs;      // por si aún no habia sincronizado
+  bcastSource = src;
+  bcastSongId = src.songId;
+  bcastBPS    = src.bps;
+  slog('broadcast:bridgeDone', { id: String(src.songId).slice(0,8) });
+  if (src.songId) detectAudioEnd(src, src.songId, src.durationSec || 0);
+}
+
+// Lanza el render en cuanto se conocen las dos canciones y el final real de A.
+function maybeRenderBridge() {
+  const cur = bcastSource, nxt = bcastPrefetch;
+  if (!cur || !nxt || bcastBridge || !cur.songId || !nxt.songId) return;
+  if (!cur.audioEndMs || !cur.sink.srate) return;
+  const secs = Math.max(1, Math.min(10, parseInt(db.getSetting('crossfade_ms') || 4000, 10) / 1000));
+  const startSec = cur.audioEndMs / 1000 - secs;
+  if (startSec <= 1) return;
+  bcastBridge = renderBridge(cur.songId, startSec, nxt.songId, secs,
+                             cur.sink.srate, cur.sink.ch || 2);
+  bcastBridge.startMs = startSec * 1000;
+}
+
 // Abre el stream de una canción en Navidrome y va llenando un sink (que descarta
 // el tag ID3 inicial). No toca el estado de emisión: sirve tanto para la canción
 // en curso como para precargar la siguiente.
 function openSource(songId, duration) {
-  const src = { songId, sink: makeSink(), bps: 16000, upstream: null, ready: false, failed: false };
+  const src = { songId, durationSec: duration, emittedMs: 0,
+                sink: makeSink(), bps: 16000, upstream: null, ready: false, failed: false };
   axios.get(nd.streamUrl(songId), { responseType: 'stream', timeout: 15000 })
     .then(upstream => {
       if (src.cancelled) { try { upstream.data.destroy(); } catch(e) {} return; }
@@ -200,6 +373,9 @@ function openSource(songId, duration) {
           // Recalcular con el tamaño real del tag ya conocido
           if (fileSize > 0 && duration > 0)
             src.bps = Math.max(1, fileSize - src.sink.skipped) / duration;
+          // Si esta fuente entra tras un bridge, saltar lo que ya sonó mezclado
+          if (src.skipPendingMs) { src.sink.out = skipFrames(src.sink.out, src.skipPendingMs); src.skipPendingMs = 0; }
+          maybeRenderBridge();   // ya se conoce el formato: se puede renderizar
         }
       });
       upstream.data.on('end',   () => { src.upstream = null; src.ended = true; });
@@ -220,10 +396,26 @@ function prefetchBroadcast(songId, duration) {
                        try { bcastPrefetch.upstream?.destroy(); } catch(e) {} }
   slog('broadcast:prefetch', { id: songId.slice(0, 8) });
   bcastPrefetch = openSource(songId, duration);
+  bcastBridge   = null;          // la mezcla vieja apuntaba a otra canción
+  maybeRenderBridge();
 }
 
 function startBroadcast(songId, duration) {
   slog('broadcast:start', { id: songId.slice(0, 8), dur: duration });
+  // Idempotencia: cuando la canción trae silencio de cola, el crossfade arranca
+  // por su cuenta ANTES de que el cliente pida el avance. Si ya estamos emitiendo
+  // esta canción — o mezclando hacia ella — no hay que reiniciarla desde cero.
+  if (bcastSongId === songId && bcastSource) return;
+  // El avance del cliente llega ~5 s antes del final. Si la mezcla para
+  // justamente esta canción ya está lista, ese avance debe DISPARAR el crossfade
+  // en vez de cancelarlo con un corte seco.
+  if (bcastBridge && bcastBridge.ready && !bcastBridge.failed &&
+      bcastBridge.songB === songId && bcastPrefetch && bcastPrefetch.songId === songId) {
+    bcastPrefetch.durationSec = duration;
+    enterBridge();
+    bcastSongId = songId;
+    return;
+  }
   const myGen = ++bcastGen;
   // Relevo: si la precarga es justo esta canción, promocionarla. El audio ya está
   // en RAM y sin tag ID3, así que el cambio no deja hueco.
@@ -250,6 +442,12 @@ function startBroadcast(songId, duration) {
   bcastJoinBuf    = Buffer.alloc(0);
   bcastBPS        = src.bps;
   bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS);
+  // Un avance explícito invalida cualquier mezcla pendiente: apuntaba a otro par
+  // de canciones. Sin esto, un skip del DJ dispararía un crossfade equivocado.
+  bcastBridge = null; bcastAfterBridge = null;
+  // Localizar dónde acaba el audio útil (sin el silencio de cola) con tiempo de
+  // sobra: el resultado se usa varios minutos después, al preparar el crossfade.
+  detectAudioEnd(src, songId, duration);
   // El ticker NO se para en los cambios de canción: si se parase, los oyentes
   // dejarían de recibir bytes hasta que Navidrome respondiese.
   if (!bcastTicker) bcastTicker = setInterval(bcastTick, TICK_MS);
@@ -261,7 +459,10 @@ function stopBroadcast() {
   for (const s of [bcastSource, bcastPrefetch]) {
     if (s) { s.cancelled = true; try { s.upstream?.destroy(); } catch (e) {} }
   }
+  if (bcastAfterBridge?.src) { bcastAfterBridge.src.cancelled = true;
+                               try { bcastAfterBridge.src.upstream?.destroy(); } catch(e) {} }
   bcastSource = null; bcastPrefetch = null; bcastSongId = null;
+  bcastBridge = null; bcastAfterBridge = null;
   bcastJoinBuf = Buffer.alloc(0);
   bcastClients.forEach(res => { try { res.end(); } catch (e) {} });
   bcastClients.clear();
@@ -774,6 +975,13 @@ app.get('/api/cover/:id', async (req, res) => {
   } catch (e) { res.status(404).send(''); }
 });
 
+// Log de diagnóstico de la sesión activa (solo admin). OJO: tiene que quedar por
+// ENCIMA del catch-all de abajo — Express casa por orden de registro, y estando
+// declarado después este endpoint devolvía siempre index.html en vez del log.
+app.get('/api/admin/log', auth.adminMiddleware, (req, res) => {
+  res.json(sessionLog);
+});
+
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/dist/index.html')));
 
 let lastProgress  = { position: 0 };
@@ -884,10 +1092,6 @@ function slog(event, data = {}) {
   io.emit('session:log', entry);
 }
 
-// Devuelve el log completo de la sesión activa (solo admin)
-app.get('/api/admin/log', auth.adminMiddleware, (req, res) => {
-  res.json(sessionLog);
-});
 
 io.on('connection', socket => {
   socket.emit('queue:update',   db.getQueue());
