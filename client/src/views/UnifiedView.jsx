@@ -784,14 +784,21 @@ export default function UnifiedView() {
 
   useEffect(() => {
     if (!authToken) { setAuthLoading(false); return; }
-    fetch('/api/auth/me', { headers: { Authorization: 'Bearer ' + authToken } })
+    // Con timeout: en movil una peticion puede quedarse colgada indefinidamente
+    // (Safari no la corta), y sin esto authLoading nunca bajaba -> spinner eterno
+    // y el usuario tenia que cerrar y reabrir la app.
+    const ac = new AbortController();
+    const to = setTimeout(() => ac.abort(), 12000);
+    fetch('/api/auth/me', { headers: { Authorization: 'Bearer ' + authToken }, signal: ac.signal })
       .then(r => r.ok ? r.json() : null)
       .then(user => {
         if (user) setCurrentUser(user);
         else { setAuthToken(null); localStorage.removeItem('jv_auth'); }
         setAuthLoading(false);
       })
-      .catch(() => setAuthLoading(false));
+      .catch(() => setAuthLoading(false))
+      .finally(() => clearTimeout(to));
+    return () => { clearTimeout(to); ac.abort(); };
   }, []);
 
   const handleAuth = (token, user) => {
@@ -906,6 +913,7 @@ export default function UnifiedView() {
   const [sessionEndTime, setSessionEndTime]   = useState(null);
   const [voterListening, setVoterListening] = useState(false);
   const [voterLoading,   setVoterLoading]   = useState(false);
+  const [voterNeedsTap,  setVoterNeedsTap]  = useState(false);  // play() bloqueado por el navegador
   // Espejo en ref: el efecto del socket tiene deps [authToken, currentUser] y no
   // se re-registra al cambiar voterListening — sus handlers leerían un valor obsoleto.
   const voterListeningRef = useRef(false);
@@ -936,6 +944,15 @@ export default function UnifiedView() {
   useEffect(() => { nowPlayingRef.current = nowPlaying; }, [nowPlaying]);
   useEffect(() => { sessionActiveRef.current = sessionActive; }, [sessionActive]);
 
+  // Salvaguarda anti-spinner: el render se bloquea mientras sessionActive sea
+  // null. Si ni el HTTP ni el socket lo entregan (movil con mala cobertura),
+  // renderizar igualmente a los 8 s en lugar de dejar la app colgada.
+  useEffect(() => {
+    if (!currentUser || sessionActive !== null) return;
+    const t = setTimeout(() => setSessionActive(prev => (prev === null ? false : prev)), 8000);
+    return () => clearTimeout(t);
+  }, [currentUser, sessionActive]);
+
   // ── init after auth ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!authToken || !currentUser) return;
@@ -949,10 +966,14 @@ export default function UnifiedView() {
     // está pausado) para NO reiniciar una canción que ya está sonando bien.
     const resyncAll = () => {
       emitJoin();
-      if (currentUser?.role !== 'admin') return; // votantes: solo re-join
+      // El estado de sesión se pide por HTTP para TODOS los roles. Antes los
+      // votantes salían aquí y solo podían recibirlo por socket: si el socket
+      // tardaba en conectar (típico en móvil), `sessionActive` se quedaba en null
+      // y la pantalla se quedaba colgada en el spinner para siempre.
       fetch('/api/session/status').then(r => r.json()).then(({ active, name, desc }) => {
         setSessionActive(active); setSessionName(name || ''); setSessionDesc(desc || '');
-      }).catch(() => {});
+      }).catch(() => setSessionActive(prev => prev === null ? false : prev));
+      if (currentUser?.role !== 'admin') return; // el resto solo aplica al admin
       fetch('/api/now-playing').then(r => r.json()).then(song => {
         if (!song) return;
         const active = getActive();
@@ -1222,31 +1243,44 @@ export default function UnifiedView() {
           } catch(e) { /* stream ended or stopped */ }
         })();
       } else {
-        // Fallback: direct audio src (Chrome/Firefox without MSE)
+        // Fallback directo: iOS Safari (iPhone) NO implementa MediaSource
         audioA.current.src = liveUrl;
         audioA.current.volume = 1;
+        audioA.current.load();   // sin load() iOS a veces ni arranca la descarga
       }
       audioA.current.addEventListener('canplay', () => setVoterLoading(false), { once: true });
       setTimeout(() => setVoterLoading(false), 10000);
-      // AudioContext keepalive: play a silent buffer every 25s so iOS
-      // does not suspend the audio session when the screen locks
-      try {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (AC) {
-          if (voterACtxRef.current) { try { voterACtxRef.current.close(); } catch(e) {} }
-          const ctx = new AC();
-          voterACtxRef.current = ctx;
-          const ping = () => {
-            if (!voterACtxRef.current) return;
-            const buf = ctx.createBuffer(1, 1, 22050);
-            const src = ctx.createBufferSource();
-            src.buffer = buf; src.connect(ctx.destination); src.start(0);
-          };
-          ping();
-          voterKaRef.current = setInterval(ping, 25000);
-        }
-      } catch(e) {}
-      audioA.current.play().catch(() => {});
+      // Keepalive con AudioContext SOLO en la rama MSE. En iOS (rama directa)
+      // crear un AudioContext cambia la categoría de sesión de audio del sistema
+      // y deja el <audio> sonando en vacío: era la causa de "carga el buffer
+      // pero no se escucha" hasta toquetear el interruptor de silencio.
+      if (useMSE) {
+        try {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (AC) {
+            if (voterACtxRef.current) { try { voterACtxRef.current.close(); } catch(e) {} }
+            const ctx = new AC();
+            voterACtxRef.current = ctx;
+            const ping = () => {
+              if (!voterACtxRef.current) return;
+              const buf = ctx.createBuffer(1, 1, 22050);
+              const src = ctx.createBufferSource();
+              src.buffer = buf; src.connect(ctx.destination); src.start(0);
+            };
+            ping();
+            voterKaRef.current = setInterval(ping, 25000);
+          }
+        } catch(e) {}
+      }
+      // No tragarse el fallo de play(): si el navegador lo bloquea hay que
+      // decírselo al usuario y darle un botón, no dejarlo mirando un buffer mudo.
+      const tryPlay = () => {
+        const a = audioA.current;
+        if (!a) return;
+        a.play().then(() => setVoterNeedsTap(false)).catch(() => setVoterNeedsTap(true));
+      };
+      tryPlay();
+      audioA.current.addEventListener('canplay', tryPlay, { once: true });  // reintento al haber datos
       setVoterListening(true);
     } catch(e) {
       console.warn('startListening error:', e);
@@ -1267,6 +1301,7 @@ export default function UnifiedView() {
     if (audioA.current) { audioA.current.pause(); audioA.current.src = ''; }
     setVoterListening(false);
     setVoterLoading(false);
+    setVoterNeedsTap(false);
   };
 
   // Arranca el crossfade con una canción ya conocida.
@@ -1801,13 +1836,34 @@ export default function UnifiedView() {
                         ? <><VolumeX size={15} /><span>Silenciar</span></>
                         : <><Volume2 size={15} /><span>Escuchar</span></>}
                     </button>
-                    {voterListening && (
+                    {voterListening && !voterNeedsTap && (
                       <span className="text-xs text-green-400 flex items-center gap-1">
                         <span className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse inline-block" />
                         En directo
                       </span>
                     )}
                   </div>
+                )}
+                {/* El navegador bloqueó la reproducción (típico en iPhone). Antes
+                    esto se tragaba en silencio y el usuario veía el buffer cargar
+                    sin oír nada, sin saber que faltaba un toque suyo. */}
+                {voterNeedsTap && (
+                  <button
+                    onClick={() => {
+                      const a = audioA.current; if (!a) return;
+                      a.play().then(() => setVoterNeedsTap(false)).catch(() => {});
+                    }}
+                    className="mt-2 w-full flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-sm font-bold text-white active:scale-95 transition-all"
+                    style={{ background: 'linear-gradient(135deg,#f59e0b,#d97706)' }}>
+                    <Volume2 size={16} />
+                    <span>Toca aquí para que suene</span>
+                  </button>
+                )}
+                {voterNeedsTap && (
+                  <p className="text-[11px] text-gray-500 mt-1.5 leading-snug">
+                    Si sigue sin oírse, comprueba que el móvil no esté en silencio
+                    (interruptor lateral) y sube el volumen multimedia.
+                  </p>
                 )}
               </div>
             )}
