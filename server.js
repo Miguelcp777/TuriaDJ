@@ -27,16 +27,17 @@ app.use(express.json());
 // Streams one Navidrome song to all voter clients at real-time bitrate.
 // Rate-limiter sends BYTES_PER_TICK every TICK_MS — default 192 kbps.
 const TICK_MS       = 50;   // 50 ms ticks for smooth delivery
-const JOIN_BUF_SECS = 0.5;  // seconds of audio kept for late joiners
+const JOIN_BUF_SECS = 1.5;  // seconds of audio kept for late joiners
 
 let bcastClients    = new Set();
-let bcastQueue      = Buffer.alloc(0);
 let bcastJoinBuf    = Buffer.alloc(0);
 let bcastJoinBufMax = 0;
 let bcastBPS        = 16000; // bytes/sec, recalculated per song
 let bcastTicker     = null;
-let bcastUpstream   = null;
 let bcastGen        = 0;     // token de generación: invalida promesas de startBroadcast obsoletas
+let bcastSongId     = null;  // canción actualmente en emisión
+let bcastSource     = null;  // fuente en emisión (ver openSource)
+let bcastPrefetch   = null;  // siguiente canción ya descargándose (ver prefetchBroadcast)
 
 // ── Log de diagnóstico por sesión ────────────────────────────────────────────
 // Se resetea en cada inicio/fin de sesión. Registra eventos clave del motor de
@@ -45,11 +46,41 @@ const SESSION_LOG_MAX = 300;
 let sessionLog       = [];
 let sessionStartTime = 0;
 
+// Devuelve cuántos bytes se pueden cortar del buffer sin partir un frame, para
+// llegar lo más cerca posible de `target`. Emitir media trama hace que el
+// decodificador del oyente escupa "Header missing" — y al cambiar de canción
+// pasaba en CADA transición, porque el corte caía en cualquier byte.
+function frameAlignedCut(buf, target) {
+  let off = 0;
+  while (off < target) {
+    const h = parseMp3Header(buf, off);
+    if (!h) break;                          // desincronizado
+    if (off + h.len > buf.length) break;    // frame aún incompleto: esperar datos
+    off += h.len;
+  }
+  return off;
+}
+
 function bcastTick() {
-  if (bcastQueue.length === 0) return;
+  const src = bcastSource;
+  // Sin fuente, o aún buscando el primer frame de audio (se está saltando el tag
+  // ID3): no hay nada que emitir todavía.
+  if (!src || !src.sink.synced || src.sink.out.length === 0) return;
+  if (src.bps) { bcastBPS = src.bps; bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS); }
   const bytesPerTick = Math.ceil(bcastBPS * TICK_MS / 1000);
-  const chunk = bcastQueue.slice(0, bytesPerTick);
-  bcastQueue  = bcastQueue.slice(bytesPerTick);
+  let cut = frameAlignedCut(src.sink.out, bytesPerTick);
+  if (cut === 0) {
+    // O falta buffer para completar el frame (esperar), o hemos perdido el sync
+    // y hay basura delante: en ese caso resincronizar descartándola.
+    if (src.sink.out.length < 4096) return;
+    const resync = findMp3FrameStart(src.sink.out);
+    if (resync <= 0) return;
+    src.sink.out = src.sink.out.slice(resync);
+    cut = frameAlignedCut(src.sink.out, bytesPerTick);
+    if (cut === 0) return;
+  }
+  const chunk  = src.sink.out.slice(0, cut);
+  src.sink.out = src.sink.out.slice(cut);
   // Rolling join buffer: keep last JOIN_BUF_SECS of audio for late joiners
   bcastJoinBuf = Buffer.concat([bcastJoinBuf, chunk]);
   if (bcastJoinBuf.length > bcastJoinBufMax && bcastJoinBufMax > 0)
@@ -107,41 +138,131 @@ function findMp3FrameStart(buf) {
   return -1;
 }
 
+// ── Salto del tag ID3v2 ──────────────────────────────────────────────────────
+// El 99,6% de la biblioteca lleva un ID3v2 con caratula incrustada (45 KB de
+// media, hasta 263 KB). El broadcast dosifica bytes a ritmo de reproduccion
+// (bcastBPS ~17 KB/s), asi que transmitir ese tag consumia 2,8 s de media —
+// hasta 16 s en el peor caso — durante los que el decodificador del oyente no
+// recibia NI UN frame de audio: silencio al empezar cada cancion. El navegador
+// del admin no lo sufre porque descarga el fichero entero a toda velocidad.
+// Nota: no basta con buscar el primer frame, porque el JPEG de la caratula
+// puede contener secuencias que lo imiten; primero se salta el tag por su
+// longitud declarada (syncsafe) y solo despues se busca el sync.
+function findAudioStart(buf) {
+  let base = 0;
+  if (buf.length >= 10 && buf[0] === 0x49 && buf[1] === 0x44 && buf[2] === 0x33) {
+    const tagLen = 10 + (((buf[6] & 0x7f) << 21) | ((buf[7] & 0x7f) << 14) |
+                         ((buf[8] & 0x7f) << 7)  |  (buf[9] & 0x7f));
+    if (buf.length < tagLen + 8) return -1;   // aun no ha llegado el final del tag
+    base = tagLen;
+  }
+  const rel = findMp3FrameStart(buf.slice(base));
+  return rel < 0 ? -1 : base + rel;
+}
+
+// Acumulador que descarta todo lo anterior al primer frame de audio y a partir
+// de ahi deja pasar los bytes tal cual.
+function makeSink() { return { pre: Buffer.alloc(0), synced: false, out: Buffer.alloc(0), skipped: 0 }; }
+
+function sinkFeed(sink, chunk) {
+  if (sink.synced) { sink.out = Buffer.concat([sink.out, chunk]); return; }
+  sink.pre = Buffer.concat([sink.pre, chunk]);
+  const start = findAudioStart(sink.pre);
+  if (start >= 0) {
+    sink.skipped = start;
+    sink.out = sink.pre.slice(start);
+    sink.pre = Buffer.alloc(0);
+    sink.synced = true;
+  } else if (sink.pre.length > 4 * 1024 * 1024) {
+    // Salvaguarda: fichero raro sin sync reconocible. Emitir tal cual antes que
+    // quedarnos callados para siempre.
+    sink.out = sink.pre; sink.pre = Buffer.alloc(0); sink.synced = true;
+  }
+}
+
+// Abre el stream de una canción en Navidrome y va llenando un sink (que descarta
+// el tag ID3 inicial). No toca el estado de emisión: sirve tanto para la canción
+// en curso como para precargar la siguiente.
+function openSource(songId, duration) {
+  const src = { songId, sink: makeSink(), bps: 16000, upstream: null, ready: false, failed: false };
+  axios.get(nd.streamUrl(songId), { responseType: 'stream', timeout: 15000 })
+    .then(upstream => {
+      if (src.cancelled) { try { upstream.data.destroy(); } catch(e) {} return; }
+      const fileSize = parseInt(upstream.headers['content-length'] || '0');
+      // El tag ID3 no se emite, así que no debe contar para el ritmo de envío.
+      const audioBytes = fileSize > 0 ? Math.max(1, fileSize - (src.sink.skipped || 0)) : 0;
+      src.bps = (audioBytes > 0 && duration > 0) ? audioBytes / duration : 16000;
+      src.upstream = upstream.data;
+      upstream.data.on('data', chunk => {
+        sinkFeed(src.sink, chunk);
+        if (src.sink.synced && !src.ready) {
+          src.ready = true;
+          // Recalcular con el tamaño real del tag ya conocido
+          if (fileSize > 0 && duration > 0)
+            src.bps = Math.max(1, fileSize - src.sink.skipped) / duration;
+        }
+      });
+      upstream.data.on('end',   () => { src.upstream = null; src.ended = true; });
+      upstream.data.on('error', () => { src.upstream = null; src.failed = true; });
+    })
+    .catch(err => { src.failed = true; console.error('broadcast source error:', err.message); });
+  return src;
+}
+
+// Precarga la siguiente canción mientras suena la actual. Se dispara desde
+// player:peek-next (~90 s de antelación), así que al cambiar de tema los bytes
+// ya están en RAM y el relevo es inmediato: sin esperar a Navidrome y sin tag.
+function prefetchBroadcast(songId, duration) {
+  if (!songId) return;
+  if (bcastSongId === songId) return;                       // ya suena
+  if (bcastPrefetch && bcastPrefetch.songId === songId) return;  // ya precargada
+  if (bcastPrefetch) { bcastPrefetch.cancelled = true;
+                       try { bcastPrefetch.upstream?.destroy(); } catch(e) {} }
+  slog('broadcast:prefetch', { id: songId.slice(0, 8) });
+  bcastPrefetch = openSource(songId, duration);
+}
+
 function startBroadcast(songId, duration) {
   slog('broadcast:start', { id: songId.slice(0, 8), dur: duration });
-  // Keep existing voter connections alive, just swap source
-  if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
-  if (bcastUpstream) { try { bcastUpstream.destroy(); } catch(e) {} bcastUpstream = null; }
-  bcastQueue = Buffer.alloc(0); bcastJoinBuf = Buffer.alloc(0);
-  const myGen = ++bcastGen;   // si llega otra llamada antes de resolver, esta queda obsoleta
-  const url = nd.streamUrl(songId);
-  axios.get(url, { responseType: 'stream', timeout: 15000 })
-    .then(upstream => {
-      // Una llamada posterior a startBroadcast invalidó esta promesa: descartar
-      // este stream para no crear un segundo bcastTicker compitiendo.
-      if (myGen !== bcastGen) { try { upstream.data.destroy(); } catch(e) {} return; }
-      const fileSize = parseInt(upstream.headers['content-length'] || '0');
-      if (fileSize > 0 && duration > 0) {
-        bcastBPS = fileSize / duration;
-        console.log('broadcast', Math.round(bcastBPS*8/1000), 'kbps (',
-          Math.round(fileSize/1024)+'KB /', duration+'s)');
-      } else {
-        bcastBPS = 16000;
-      }
-      bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS);
-      bcastUpstream = upstream.data;
-      upstream.data.on('data', chunk => { bcastQueue = Buffer.concat([bcastQueue, chunk]); });
-      upstream.data.on('end',  () => { bcastUpstream = null; });
-      upstream.data.on('error', () => { bcastUpstream = null; });
-      bcastTicker = setInterval(bcastTick, TICK_MS);
-    })
-    .catch(err => console.error('broadcast start error:', err.message));
+  const myGen = ++bcastGen;
+  // Relevo: si la precarga es justo esta canción, promocionarla. El audio ya está
+  // en RAM y sin tag ID3, así que el cambio no deja hueco.
+  let src;
+  if (bcastPrefetch && bcastPrefetch.songId === songId && !bcastPrefetch.failed) {
+    src = bcastPrefetch;
+    slog('broadcast:usePrefetch', { id: songId.slice(0, 8), buffered: src.sink.out.length });
+  } else {
+    if (bcastPrefetch) { bcastPrefetch.cancelled = true;
+                         try { bcastPrefetch.upstream?.destroy(); } catch(e) {} }
+    src = openSource(songId, duration);
+  }
+  bcastPrefetch = null;
+
+  // Cerrar la fuente anterior (no la nueva) y adoptar la nueva como emisión.
+  // Cerrar la fuente anterior. Ojo: hay que cerrar la vieja, nunca `src` — y no
+  // vale guardarse el upstream aparte, porque cuando se promociona una precarga
+  // la petición axios puede no haber resuelto todavía.
+  const prev = bcastSource;
+  if (prev && prev !== src) { prev.cancelled = true;
+                              try { prev.upstream?.destroy(); } catch(e) {} }
+  bcastSource     = src;
+  bcastSongId     = songId;
+  bcastJoinBuf    = Buffer.alloc(0);
+  bcastBPS        = src.bps;
+  bcastJoinBufMax = Math.ceil(bcastBPS * JOIN_BUF_SECS);
+  // El ticker NO se para en los cambios de canción: si se parase, los oyentes
+  // dejarían de recibir bytes hasta que Navidrome respondiese.
+  if (!bcastTicker) bcastTicker = setInterval(bcastTick, TICK_MS);
+  void myGen;
 }
 
 function stopBroadcast() {
-  if (bcastTicker)   { clearInterval(bcastTicker); bcastTicker = null; }
-  if (bcastUpstream) { try { bcastUpstream.destroy(); } catch (e) {} bcastUpstream = null; }
-  bcastQueue = Buffer.alloc(0); bcastJoinBuf = Buffer.alloc(0);
+  if (bcastTicker) { clearInterval(bcastTicker); bcastTicker = null; }
+  for (const s of [bcastSource, bcastPrefetch]) {
+    if (s) { s.cancelled = true; try { s.upstream?.destroy(); } catch (e) {} }
+  }
+  bcastSource = null; bcastPrefetch = null; bcastSongId = null;
+  bcastJoinBuf = Buffer.alloc(0);
   bcastClients.forEach(res => { try { res.end(); } catch (e) {} });
   bcastClients.clear();
 }
@@ -501,6 +622,10 @@ async function advanceQueue({ auto = false } = {}) {
     db.setNowPlaying(next);
     lastProgress = { position: 0 };
     startBroadcast(next.id, next.duration || 0);
+    // Si ya se sabe cuál viene después, empezar a bajarla ya: así el relevo no
+    // depende de que un cliente llegue a pedir peek-next.
+    const after = db.getQueue()[0];
+    if (after) prefetchBroadcast(after.id, after.duration || 0);
     autoDJActive = false;
     broadcast();
     io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
@@ -820,9 +945,14 @@ io.on('connection', socket => {
     slog('peekNext:recv', { hasPending: !!pendingAutoDJ });
     try {
       const queue = db.getQueue();
-      if (queue.length) return cb({ song: queue[0] });
+      if (queue.length) {
+        // Aprovechar el aviso para precargar también el broadcast de los voters
+        prefetchBroadcast(queue[0].id, queue[0].duration || 0);
+        return cb({ song: queue[0] });
+      }
       if (!db.getAutoDJEnabled()) return cb({ song: null });
       if (!pendingAutoDJ) pendingAutoDJ = await pickAutoDJSong();
+      if (pendingAutoDJ) prefetchBroadcast(pendingAutoDJ.id, pendingAutoDJ.duration || 0);
       cb({ song: pendingAutoDJ });
     } catch (e) {
       console.error('player:peek-next error:', e.message);

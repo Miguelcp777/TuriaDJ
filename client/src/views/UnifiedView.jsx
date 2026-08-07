@@ -1185,12 +1185,39 @@ export default function UnifiedView() {
         const reader = resp.body.getReader();
         voterRdrRef.current = reader;
         (async () => {
+          const waitIdle = () => sb.updating
+            ? new Promise(r => sb.addEventListener('updateend', r, { once: true }))
+            : Promise.resolve();
+          // El SourceBuffer crecia sin limite (~16 KB/s de stream). Al agotarse la
+          // cuota de MSE, appendBuffer lanza QuotaExceededError, el catch de abajo
+          // se lo tragaba y el bucle moria: la musica se paraba sola tras un rato
+          // largo escuchando. Podar lo ya reproducido lo mantiene vivo.
+          const prune = async () => {
+            try {
+              const cur = audioA.current?.currentTime || 0;
+              if (cur > 30 && sb.buffered.length) {
+                const start = sb.buffered.start(0);
+                if (cur - 20 > start) { await waitIdle(); sb.remove(start, cur - 20); await waitIdle(); }
+              }
+            } catch(e) {}
+          };
           try {
+            let sincePrune = 0;
             for (;;) {
               const { done, value } = await reader.read();
               if (done || !voterRdrRef.current) break;
-              if (sb.updating) await new Promise(r => sb.addEventListener('updateend', r, { once: true }));
-              if (ms.readyState === 'open') sb.appendBuffer(value);
+              if (ms.readyState !== 'open') break;
+              await waitIdle();
+              try {
+                sb.appendBuffer(value);
+              } catch(err) {
+                if (err && err.name === 'QuotaExceededError') {
+                  await prune();
+                  try { await waitIdle(); sb.appendBuffer(value); } catch(e2) { /* descartar chunk */ }
+                } else throw err;
+              }
+              sincePrune += value.length;
+              if (sincePrune > 2000000) { sincePrune = 0; await prune(); }   // poda proactiva
             }
           } catch(e) { /* stream ended or stopped */ }
         })();
