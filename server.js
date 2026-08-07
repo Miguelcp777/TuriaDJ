@@ -55,18 +55,46 @@ function bcastTick() {
 
 // El join buffer es una ventana rodante de bytes MP3 que empieza en un punto
 // arbitrario (a media trama). Los decodificadores del navegador necesitan una
-// cabecera de frame válida (sync 0xFFEx) para empezar a decodificar; si el
-// stream arranca a mitad de frame, el voter que entra a mitad de canción no
-// sincroniza y no oye nada hasta el siguiente tema. Esta función busca el primer
-// frame válido para recortar el join buffer y que arranque decodificable.
+// cabecera de frame válida para empezar a decodificar; si el stream arranca a
+// mitad de frame, el voter que entra a mitad de canción no sincroniza y no oye
+// nada hasta el siguiente tema.
+//
+// OJO con los falsos positivos: buscar solo el sync 0xFFEx no basta — el payload
+// de audio contiene rachas de 0xFF que parecen cabeceras. Hay que exigir Layer III
+// y encadenar dos frames consecutivos (el segundo debe caer exactamente donde
+// predice la longitud del primero).
+const MP3_BR_V1L3 = [0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0];
+const MP3_BR_V2L3 = [0, 8,16,24,32,40,48,56, 64, 80, 96,112,128,144,160,0];
+const MP3_SRATES   = { 3: [44100,48000,32000], 2: [22050,24000,16000], 0: [11025,12000,8000] };
+
+function parseMp3Header(buf, i) {
+  if (i + 4 > buf.length) return null;
+  if (buf[i] !== 0xFF || (buf[i + 1] & 0xE0) !== 0xE0) return null;
+  const ver   = (buf[i + 1] >> 3) & 0x03;   // 3=MPEG1, 2=MPEG2, 0=MPEG2.5, 1=reservado
+  const layer = (buf[i + 1] >> 1) & 0x03;   // 1 = Layer III (MP3); 0=reservado
+  if (ver === 1 || layer !== 1) return null;
+  const brIdx = (buf[i + 2] >> 4) & 0x0F;
+  const srIdx = (buf[i + 2] >> 2) & 0x03;
+  if (brIdx === 0 || brIdx === 15 || srIdx === 3) return null;  // free/bad/reservado
+  const bitrate = (ver === 3 ? MP3_BR_V1L3 : MP3_BR_V2L3)[brIdx] * 1000;
+  const srate   = MP3_SRATES[ver][srIdx];
+  if (!bitrate || !srate) return null;
+  const pad = (buf[i + 2] >> 1) & 0x01;
+  const spf = ver === 3 ? 1152 : 576;       // samples/frame Layer III
+  const len = Math.floor(spf / 8 * bitrate / srate) + pad;
+  if (len < 24) return null;
+  return { len, srate };
+}
+
 function findMp3FrameStart(buf) {
-  for (let i = 0; i + 1 < buf.length; i++) {
-    if (buf[i] === 0xFF && (buf[i + 1] & 0xE0) === 0xE0) {
-      const ver   = (buf[i + 1] >> 3) & 0x03; // 01 = reservado (inválido)
-      const layer = (buf[i + 1] >> 1) & 0x03; // 00 = reservado (inválido)
-      if (ver === 1 || layer === 0) continue;
-      return i;
-    }
+  for (let i = 0; i + 4 <= buf.length; i++) {
+    const h1 = parseMp3Header(buf, i);
+    if (!h1) continue;
+    const j = i + h1.len;
+    if (j + 4 > buf.length) continue;       // no se puede confirmar: seguir buscando
+    const h2 = parseMp3Header(buf, j);
+    if (!h2 || h2.srate !== h1.srate) continue;
+    return i;                                // dos frames encadenados → sync real
   }
   return -1;
 }
