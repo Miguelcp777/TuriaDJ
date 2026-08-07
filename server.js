@@ -345,8 +345,18 @@ function finishBridge() {
   if (src.songId) detectAudioEnd(src, src.songId, src.durationSec || 0);
 }
 
+// Interruptor del crossfade de servidor. Por DEFECTO DESACTIVADO: la ruta que
+// dispara la mezcla por el reloj de audio (final natural de la cancion) no esta
+// suficientemente probada y dejo la reproduccion muda en produccion. Con esto en
+// '0' el motor cae al relevo gapless, que si esta verificado A/B. Se reactiva con
+// POST /api/player/server-crossfade {enabled:true} sin tocar codigo.
+function serverCrossfadeEnabled() {
+  return db.getSetting('crossfade_server') === '1';
+}
+
 // Lanza el render en cuanto se conocen las dos canciones y el final real de A.
 function maybeRenderBridge() {
+  if (!serverCrossfadeEnabled()) return;
   const cur = bcastSource, nxt = bcastPrefetch;
   if (!cur || !nxt || bcastBridge || !cur.songId || !nxt.songId) return;
   if (!cur.audioEndMs || !cur.sink.srate) return;
@@ -411,7 +421,7 @@ function startBroadcast(songId, duration) {
   // Idempotencia: cuando la canción trae silencio de cola, el crossfade arranca
   // por su cuenta ANTES de que el cliente pida el avance. Si ya estamos emitiendo
   // esta canción — o mezclando hacia ella — no hay que reiniciarla desde cero.
-  if (bcastSongId === songId && bcastSource) return;
+  if (bcastSongId === songId && bcastSource && !bcastSource.failed) return;
   // El avance del cliente llega ~5 s antes del final. Si la mezcla para
   // justamente esta canción ya está lista, ese avance debe DISPARAR el crossfade
   // en vez de cancelarlo con un corte seco.
@@ -986,6 +996,15 @@ app.get('/api/cover/:id', async (req, res) => {
 // declarado después este endpoint devolvía siempre index.html en vez del log.
 app.get('/api/admin/log', auth.adminMiddleware, (req, res) => {
   res.json(sessionLog);
+});
+
+// Interruptor del crossfade de servidor (ver serverCrossfadeEnabled)
+app.post('/api/player/server-crossfade', auth.adminMiddleware, (req, res) => {
+  const { enabled } = req.body || {};
+  db.setSetting('crossfade_server', enabled ? '1' : '0');
+  if (!enabled) { bcastBridge = null; bcastAfterBridge = null; }
+  slog('broadcast:serverCrossfade', { enabled: !!enabled });
+  res.json({ success: true, enabled: !!enabled });
 });
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'client/dist/index.html')));
