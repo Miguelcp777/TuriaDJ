@@ -1,7 +1,14 @@
 const jwt     = require('jsonwebtoken');
 const bcrypt  = require('bcryptjs');
 
-const SECRET = process.env.JWT_SECRET || 'turiaDJ-falla-2025-secret';
+// Sin fallback: un valor por defecto en un repo publico permite falsificar
+// tokens de admin contra cualquier despliegue que no defina la variable.
+// Preferimos que el servidor no arranque a que arranque inseguro.
+const SECRET = process.env.JWT_SECRET;
+if (!SECRET || SECRET.length < 32) {
+  console.error('FATAL: JWT_SECRET no definido (o < 32 caracteres). Define JWT_SECRET en .env.');
+  process.exit(1);
+}
 
 const hashPassword   = (pw)   => bcrypt.hashSync(pw, 10);
 const verifyPassword = (pw, h) => bcrypt.compareSync(pw, h);

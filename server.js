@@ -11,7 +11,15 @@ const auth     = require('./auth');
 
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, { cors: { origin: '*' } });
+// CORS restringido: con origin '*' cualquier web podia abrir un socket contra
+// este servidor. Lista de origenes separada por comas en ALLOWED_ORIGIN.
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+if (!ALLOWED_ORIGINS.length) {
+  console.error('FATAL: ALLOWED_ORIGIN no definido (lista de origenes separada por comas).');
+  process.exit(1);
+}
+const io     = new Server(server, { cors: { origin: ALLOWED_ORIGINS } });
 
 app.use(express.json());
 
@@ -150,8 +158,14 @@ app.use(express.static(path.join(__dirname, 'client/dist')));
 // Seed admin on first run
 const existing = db.getUserByUsername('admin');
 if (!existing) {
-  db.createUser('admin', auth.hashPassword('admin'), 'admin');
-  console.log('Admin created: admin / admin');
+  // Nunca sembrar una contrasena por defecto: en un despliegue accesible desde
+  // Internet equivale a no tener contrasena.
+  if (!process.env.ADMIN_PASSWORD) {
+    console.error('FATAL: no hay usuario admin y ADMIN_PASSWORD no esta definido.');
+    process.exit(1);
+  }
+  db.createUser('admin', auth.hashPassword(process.env.ADMIN_PASSWORD), 'admin');
+  console.log('Admin creado desde ADMIN_PASSWORD');
 }
 
 const broadcast = () => {
