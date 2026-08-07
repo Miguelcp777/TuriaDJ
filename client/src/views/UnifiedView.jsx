@@ -1581,6 +1581,51 @@ export default function UnifiedView() {
     navigator.mediaSession.playbackState = voterListening ? 'playing' : 'paused';
   }, [voterListening, nowPlaying, isAdmin]);
 
+  // ── Recuperacion del stream del voter (segundo plano / atascos) ───────────
+  // El handler de visibilitychange que ya existia esta restringido al admin, asi
+  // que un votante que dejaba la app en segundo plano se quedaba sin nadie que
+  // reanudase nada: iOS suspende la pestaña, el <audio> se queda sin datos y la
+  // musica no volvia sola al regresar. Aqui se reanuda, y si la conexion del
+  // stream murio del todo se vuelve a abrir entera.
+  const recoverVoterAudio = () => {
+    if (!voterListeningRef.current || document.hidden) return;
+    const a = audioA.current;
+    if (!a) return;
+    if (!a.src || a.readyState === 0 || a.ended) { startListening(); return; }  // fuente muerta
+    if (a.paused) a.play().catch(() => setVoterNeedsTap(true));
+  };
+  const recoverRef = useRef(recoverVoterAudio);
+  useEffect(() => { recoverRef.current = recoverVoterAudio; });
+
+  useEffect(() => {
+    if (isAdmin) return;
+    const onWake = () => recoverRef.current();
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('focus', onWake);
+    window.addEventListener('pageshow', onWake);
+    return () => {
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('focus', onWake);
+      window.removeEventListener('pageshow', onWake);
+    };
+  }, [isAdmin]);
+
+  // Vigilante: iOS puede pausar el audio sin emitir visibilitychange. Si con la
+  // pestaña visible el reloj del <audio> deja de avanzar, se reabre el stream.
+  useEffect(() => {
+    if (isAdmin || !voterListening) return;
+    let last = -1, stuck = 0;
+    const id = setInterval(() => {
+      const a = audioA.current;
+      if (!a || document.hidden) return;
+      if (a.paused) { a.play().catch(() => {}); return; }
+      if (a.currentTime === last) {
+        if (++stuck >= 3) { stuck = 0; last = -1; startListening(); }   // ~9 s atascado
+      } else { stuck = 0; last = a.currentTime; }
+    }, 3000);
+    return () => clearInterval(id);
+  }, [isAdmin, voterListening]);
+
   // ── PWA install prompt (Android: beforeinstallprompt / iOS: detect Safari) ─
   useEffect(() => {
     const dismissed = localStorage.getItem('pwa_banner_dismissed');

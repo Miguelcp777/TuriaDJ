@@ -27,7 +27,13 @@ app.use(express.json());
 // Streams one Navidrome song to all voter clients at real-time bitrate.
 // Rate-limiter sends BYTES_PER_TICK every TICK_MS — default 192 kbps.
 const TICK_MS       = 50;   // 50 ms ticks for smooth delivery
-const JOIN_BUF_SECS = 1.5;  // seconds of audio kept for late joiners
+// Colchon que se entrega de golpe al conectar. El motor emite a tiempo real
+// exacto, asi que sin esto el oyente vive con ~0 s de margen: en cuanto el movil
+// pasa a segundo plano y el sistema throttlea la pestaña, se queda sin audio y
+// la reproduccion se para. Con 6 s aguanta las suspensiones cortas. Es el clasico
+// "burst on connect" de las radios por internet: el precio es empezar a escuchar
+// unos segundos por detras del directo.
+const JOIN_BUF_SECS = 6;
 
 let bcastClients    = new Set();
 let bcastJoinBuf    = Buffer.alloc(0);
