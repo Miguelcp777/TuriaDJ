@@ -53,6 +53,24 @@ function bcastTick() {
   dead.forEach(r => bcastClients.delete(r));
 }
 
+// El join buffer es una ventana rodante de bytes MP3 que empieza en un punto
+// arbitrario (a media trama). Los decodificadores del navegador necesitan una
+// cabecera de frame válida (sync 0xFFEx) para empezar a decodificar; si el
+// stream arranca a mitad de frame, el voter que entra a mitad de canción no
+// sincroniza y no oye nada hasta el siguiente tema. Esta función busca el primer
+// frame válido para recortar el join buffer y que arranque decodificable.
+function findMp3FrameStart(buf) {
+  for (let i = 0; i + 1 < buf.length; i++) {
+    if (buf[i] === 0xFF && (buf[i + 1] & 0xE0) === 0xE0) {
+      const ver   = (buf[i + 1] >> 3) & 0x03; // 01 = reservado (inválido)
+      const layer = (buf[i + 1] >> 1) & 0x03; // 00 = reservado (inválido)
+      if (ver === 1 || layer === 0) continue;
+      return i;
+    }
+  }
+  return -1;
+}
+
 function startBroadcast(songId, duration) {
   slog('broadcast:start', { id: songId.slice(0, 8), dur: duration });
   // Keep existing voter connections alive, just swap source
@@ -547,8 +565,15 @@ app.get('/api/live', (req, res) => {
   res.setHeader('Cache-Control', 'no-cache, no-store');
   res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders();
-  // Send rolling join buffer so late joiners start playing immediately
-  if (bcastJoinBuf.length > 0) res.write(Buffer.from(bcastJoinBuf));
+  // Send rolling join buffer so late joiners start playing immediately.
+  // Alineado a frame MP3: sin esto el buffer empieza a media trama y el
+  // decodificador del navegador no sincroniza (silencio hasta el siguiente tema).
+  if (bcastJoinBuf.length > 0) {
+    const start = findMp3FrameStart(bcastJoinBuf);
+    if (start >= 0) res.write(Buffer.from(bcastJoinBuf.slice(start)));
+    // start < 0: no hay frame válido en el buffer → no enviamos nada; el cliente
+    // sincroniza con los siguientes ticks del broadcast en cuanto llegue una cabecera.
+  }
   bcastClients.add(res);
   req.on('close', () => { bcastClients.delete(res); });
   req.socket.on('error', () => { bcastClients.delete(res); });
