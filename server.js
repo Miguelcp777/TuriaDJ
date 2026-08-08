@@ -242,37 +242,51 @@ function sinkFeed(sink, chunk) {
 // Todo degrada con seguridad: si algo falla se hace el corte limpio de siempre.
 const BRIDGE_MAX_BYTES = 6 * 1024 * 1024;
 
+// Localiza donde acaba la musica AUDIBLE. `silencedetect` NO sirve: exige que el
+// nivel siga bajo el umbral de forma continua, asi que un desvanecimiento con
+// golpes sueltos lo resetea y da el final en el ultimo suspiro. Medido sobre
+// "Chulo": situaba el final donde la cancion ya sonaba a -31 dB, 22 dB por debajo
+// de su media -> el solapamiento habria sido inaudible. Aqui se toma el RMS en
+// ventanas de ~1 s y se busca la ultima que supere (media - TAIL_DROP_DB). Con
+// eso "Chulo" recorta 7,6 s de fade y entra en la mezcla a -9,1 dB (nivel pleno).
+const TAIL_DROP_DB = 12;
+
 function detectAudioEnd(src, songId, durationSec) {
-  if (!durationSec || durationSec < 10) return;
-  const ff = spawn('ffmpeg', ['-v','info','-i', nd.streamUrl(songId),
-                              '-af','silencedetect=n=-50dB:d=0.6','-f','null','-']);
-  let err = '';
-  ff.stderr.on('data', d => { err += d.toString(); if (err.length > 65536) err = err.slice(-65536); });
+  if (!durationSec || durationSec < 20) return;
+  const ff = spawn('ffmpeg', ['-hide_banner','-nostats','-i', nd.streamUrl(songId),
+    '-af','astats=metadata=1:reset=45,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-',
+    '-f','null','-']);
+  let out = '';
+  ff.stdout.on('data', d => { out += d.toString(); if (out.length > 4e6) { try { ff.kill('SIGKILL'); } catch(e) {} } });
+  ff.stderr.on('data', () => {});
   ff.on('error', () => {});
   ff.on('close', () => {
     if (src.cancelled) return;
-    // Emparejar los bloques en orden. El silencio de cola es el ultimo bloque que
-    // o bien no tiene cierre (llega a EOF) o bien cierra justo al final del
-    // fichero — este segundo caso es el habitual y se me escapaba al principio.
-    const blocks = []; let open = null;
-    for (const m of err.matchAll(/silence_(start|end):\s*([\d.]+)/g)) {
-      const t = parseFloat(m[2]);
-      if (m[1] === 'start') { open = { start: t, end: null }; blocks.push(open); }
-      else if (open) { open.end = t; open = null; }
-    }
+    const v = [...out.matchAll(/RMS_level=(-?[\d.]+|-inf)/g)]
+      .map(m => m[1] === '-inf' ? -99 : parseFloat(m[1]))
+      .filter(x => !isNaN(x));
     let endMs = durationSec * 1000;
-    const last = blocks[blocks.length - 1];
-    if (last && last.start > durationSec * 0.5) {
-      const reachesEof = last.end === null || last.end >= durationSec - 0.35;
-      if (reachesEof && durationSec - last.start > 0.7) endMs = last.start * 1000;
+    if (v.length >= 10) {
+      // Media en dominio de potencia = RMS global de la cancion
+      const meanDb = 10 * Math.log10(v.reduce((a, x) => a + Math.pow(10, x / 10), 0) / v.length);
+      const th  = meanDb - TAIL_DROP_DB;
+      const win = durationSec / v.length;
+      let last = v.length - 1;
+      while (last > 0 && v[last] < th) last--;
+      endMs = Math.min(durationSec, (last + 1) * win) * 1000;
+      // Nunca recortar mas del 20% ni mas de 20 s: hay outros largos y tranquilos
+      // que siguen siendo musica y no deben perderse.
+      const maxCut = Math.min(20000, durationSec * 1000 * 0.2);
+      if (durationSec * 1000 - endMs > maxCut) endMs = durationSec * 1000 - maxCut;
     }
     src.audioEndMs = endMs;
-    if (endMs < durationSec * 1000 - 100)
-      slog('broadcast:tailSilence', { id: songId.slice(0,8), cut: +((durationSec - endMs/1000).toFixed(1)) });
+    if (endMs < durationSec * 1000 - 200)
+      slog('broadcast:tailCut', { id: songId.slice(0, 8), cut: +((durationSec - endMs / 1000).toFixed(1)) });
     maybeRenderBridge();
   });
-  setTimeout(() => { try { ff.kill('SIGKILL'); } catch(e) {} }, 45000);
+  setTimeout(() => { try { ff.kill('SIGKILL'); } catch(e) {} }, 60000);
 }
+
 
 // Genera el segmento de mezcla A→B. `startSec` es el punto de A donde arranca.
 function renderBridge(songA, startSec, songB, secs, srate, ch) {
@@ -371,7 +385,11 @@ function maybeRenderBridge() {
   const cur = bcastSource, nxt = bcastPrefetch;
   if (!cur || !nxt || bcastBridge || !cur.songId || !nxt.songId) return;
   if (!cur.audioEndMs || !cur.sink.srate) return;
-  const secs = Math.max(1, Math.min(10, parseInt(db.getSetting('crossfade_ms') || 4000, 10) / 1000));
+  // Suelo de 3 s: el solapamiento debe ser audible. El slider de la UI llega a
+  // bajar a 1 s, que para una mezcla en el servidor se queda en nada.
+  const secs = Math.max(3, Math.min(10, parseInt(db.getSetting('crossfade_ms') || 4000, 10) / 1000));
+  // audioEndMs es donde acaba la MUSICA, no el fichero: si la cancion trae 4 s
+  // de silencio final, la mezcla arranca 4+secs segundos antes del final real.
   const startSec = cur.audioEndMs / 1000 - secs;
   if (startSec <= 1) return;
   bcastBridge = renderBridge(cur.songId, startSec, nxt.songId, secs,
