@@ -111,19 +111,22 @@ function AuthModal({ onAuth }) {
           <h1 className="text-3xl font-extrabold tracking-tight">TuriaDJ</h1>
           <p className="text-xs text-red-400 font-semibold uppercase tracking-widest mt-1">Falla Turia · Plaça de l'Ajuntament</p>
         </div>
-        {/* Acceso con Google. Solo aparece si el servidor tiene GOOGLE_CLIENT_ID
-            configurado; si no, la pantalla queda exactamente como estaba. */}
-        {googleReady && (
-          <div className="mb-5">
-            <div ref={googleBtnRef} className="flex justify-center [color-scheme:light]" />
-            {googleError && <p className="text-red-400 text-xs text-center mt-2">{googleError}</p>}
+        {/* Acceso con Google. El contenedor tiene que estar SIEMPRE en el DOM: si
+            se renderiza solo cuando googleReady es true se produce un bloqueo
+            circular, porque renderButton necesita el div y googleReady solo se
+            activa despues de pintarlo. Vacio no ocupa nada, asi que cuando Google
+            no esta configurado la pantalla queda igual que antes. */}
+        <div className={googleReady ? 'mb-5' : ''}>
+          <div ref={googleBtnRef} className="flex justify-center [color-scheme:light]" />
+          {googleError && <p className="text-red-400 text-xs text-center mt-2">{googleError}</p>}
+          {googleReady && (
             <div className="flex items-center gap-3 mt-5">
               <div className="flex-1 h-px bg-gray-800" />
               <span className="text-[11px] text-gray-600 uppercase tracking-widest">o</span>
               <div className="flex-1 h-px bg-gray-800" />
             </div>
-          </div>
-        )}
+          )}
+        </div>
         <div className="flex bg-gray-900 rounded-2xl p-1 mb-6">
           {['login','register'].map(t => (
             <button key={t} onClick={() => { setTab(t); setError(''); setPassword2(''); }}
