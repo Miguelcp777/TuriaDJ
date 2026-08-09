@@ -98,6 +98,18 @@ function bcastTick() {
   // de la canción (sin su silencio de cola) y no donde el cliente decida.
   if (!src.isBridge && bcastBridge && bcastBridge.ready && !bcastBridge.failed &&
       bcastBridge.startMs && src.emittedMs >= bcastBridge.startMs) {
+    // La mezcla se renderizo hace minutos. Si desde entonces alguien ha añadido
+    // o votado una cancion, la "siguiente" ya no es la misma y ese puente lleva
+    // dentro la cabeza de OTRO tema: sonarian unos segundos de una cancion que
+    // nadie ha pedido. Se comprueba justo antes de usarlo.
+    const esperado = nextUpId();
+    if (esperado && bcastBridge.songB !== esperado) {
+      slog('broadcast:bridgeStale', { tenia: String(bcastBridge.songB).slice(0, 8),
+                                      toca: String(esperado).slice(0, 8) });
+      bcastBridge = null;
+      prefetchBroadcast(esperado, nextUpDuration());   // precargar la correcta
+      return;
+    }
     enterBridge();
     return;
   }
@@ -347,6 +359,12 @@ function renderBridge(songA, startSec, songB, secs, srate, ch) {
 function enterBridge() {
   const b = bcastBridge;
   if (!b || !b.ready || !bcastPrefetch || bcastPrefetch.songId !== b.songB) { bcastBridge = null; return; }
+  // Ultima verja: nunca mezclar hacia una cancion que ya no es la siguiente.
+  const esperado = nextUpId();
+  if (esperado && b.songB !== esperado) {
+    slog('broadcast:bridgeStale', { tenia: String(b.songB).slice(0, 8), toca: String(esperado).slice(0, 8) });
+    bcastBridge = null; return;
+  }
   slog('broadcast:crossfade', { secs: b.secs, kb: Math.round(b.buf.length/1024) });
   const prev = bcastSource;
   bcastAfterBridge = { src: bcastPrefetch, skipMs: b.secs * 1000 };
@@ -447,6 +465,20 @@ function openSource(songId, duration, offsetSec = 0) {
 // Precarga la siguiente canción mientras suena la actual. Se dispara desde
 // player:peek-next (~90 s de antelación), así que al cambiar de tema los bytes
 // ya están en RAM y el relevo es inmediato: sin esperar a Navidrome y sin tag.
+// Que cancion sonara de verdad a continuacion: manda la cola de usuarios y, si
+// esta vacia, la pre-eleccion de AutoDJ. Es la referencia para saber si una
+// mezcla ya renderizada se ha quedado obsoleta.
+function nextUpId() {
+  const q = db.getQueue();
+  if (q.length) return q[0].id;
+  return (db.getAutoDJEnabled() && pendingAutoDJ) ? pendingAutoDJ.id : null;
+}
+function nextUpDuration() {
+  const q = db.getQueue();
+  if (q.length) return q[0].duration || 0;
+  return pendingAutoDJ ? (pendingAutoDJ.duration || 0) : 0;
+}
+
 // Deja elegida y DESCARGANDOSE la siguiente cancion de AutoDJ nada mas empezar la
 // actual. Antes esto solo ocurria si un cliente llamaba a `player:peek-next`, asi
 // que en una sesion sin PlayerView activo no habia precarga: al cambiar de tema
@@ -573,9 +605,26 @@ if (!existing) {
   console.log('Admin creado desde ADMIN_PASSWORD');
 }
 
+// Toda mutacion de la cola (añadir, votar, quitar, fijar, vaciar) pasa por aqui.
+// Si con ello cambia cual es la SIGUIENTE cancion, la mezcla y la precarga que ya
+// estaban preparadas apuntan a otro tema: hay que tirarlas y preparar la buena.
+// Sin esto sonaban unos segundos de una cancion que nadie habia pedido.
+function syncNextUp() {
+  const esperado = nextUpId();
+  if (!esperado) return;
+  if (bcastPrefetch && bcastPrefetch.songId !== esperado) {
+    bcastPrefetch.cancelled = true;
+    try { bcastPrefetch.upstream?.destroy(); } catch (e) {}
+    bcastPrefetch = null;
+  }
+  if (bcastBridge && bcastBridge.songB !== esperado) bcastBridge = null;
+  if (!bcastPrefetch && bcastSongId !== esperado) prefetchBroadcast(esperado, nextUpDuration());
+}
+
 const broadcast = () => {
   io.emit('queue:update',  db.getQueue());
   io.emit('player:update', db.getNowPlaying());
+  try { syncNextUp(); } catch (e) { console.error('syncNextUp error:', e.message); }
 };
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
