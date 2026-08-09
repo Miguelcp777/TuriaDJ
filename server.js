@@ -249,11 +249,21 @@ const BRIDGE_MAX_BYTES = 6 * 1024 * 1024;
 // de su media -> el solapamiento habria sido inaudible. Aqui se toma el RMS en
 // ventanas de ~1 s y se busca la ultima que supere (media - TAIL_DROP_DB). Con
 // eso "Chulo" recorta 7,6 s de fade y entra en la mezcla a -9,1 dB (nivel pleno).
-const TAIL_DROP_DB = 12;
+const TAIL_DROP_DB  = 12;
+const TAIL_SCAN_SEC = 100;                 // solo se analiza el final de la cancion
+const audioEndCache = new Map();           // songId -> endMs (las canciones se repiten)
 
 function detectAudioEnd(src, songId, durationSec) {
   if (!durationSec || durationSec < 20) return;
-  const ff = spawn('ffmpeg', ['-hide_banner','-nostats','-i', nd.streamUrl(songId),
+  const cached = audioEndCache.get(songId);
+  if (cached !== undefined) { src.audioEndMs = cached; maybeRenderBridge(); return; }
+
+  // Analizar la cancion ENTERA costaba 6,6 s de descarga y decodificacion por cada
+  // tema, compitiendo con el hilo que emite el audio. Solo interesa el final, asi
+  // que se salta directamente ahi. La referencia de "nivel pleno" se toma del
+  // percentil 75 de ese tramo en vez de la media global.
+  const from = Math.max(0, durationSec - TAIL_SCAN_SEC);
+  const ff = spawn('ffmpeg', ['-hide_banner','-nostats','-ss', String(from), '-i', nd.streamUrl(songId),
     '-af','astats=metadata=1:reset=45,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-',
     '-f','null','-']);
   let out = '';
@@ -267,19 +277,23 @@ function detectAudioEnd(src, songId, durationSec) {
       .filter(x => !isNaN(x));
     let endMs = durationSec * 1000;
     if (v.length >= 10) {
-      // Media en dominio de potencia = RMS global de la cancion
-      const meanDb = 10 * Math.log10(v.reduce((a, x) => a + Math.pow(10, x / 10), 0) / v.length);
-      const th  = meanDb - TAIL_DROP_DB;
-      const win = durationSec / v.length;
+      // Referencia de "nivel pleno": percentil 75 del tramo analizado. Con la media
+      // no valdria, porque si el tramo es mayoritariamente fade la media ya es baja.
+      const ord = [...v].sort((a, b) => a - b);
+      const refDb = ord[Math.floor(ord.length * 0.75)];
+      const th  = refDb - TAIL_DROP_DB;
+      const win = (durationSec - from) / v.length;      // el tramo empieza en `from`
       let last = v.length - 1;
       while (last > 0 && v[last] < th) last--;
-      endMs = Math.min(durationSec, (last + 1) * win) * 1000;
+      endMs = Math.min(durationSec, from + (last + 1) * win) * 1000;
       // Nunca recortar mas del 20% ni mas de 20 s: hay outros largos y tranquilos
       // que siguen siendo musica y no deben perderse.
       const maxCut = Math.min(20000, durationSec * 1000 * 0.2);
       if (durationSec * 1000 - endMs > maxCut) endMs = durationSec * 1000 - maxCut;
     }
     src.audioEndMs = endMs;
+    audioEndCache.set(songId, endMs);
+    if (audioEndCache.size > 400) audioEndCache.delete(audioEndCache.keys().next().value);
     if (endMs < durationSec * 1000 - 200)
       slog('broadcast:tailCut', { id: songId.slice(0, 8), cut: +((durationSec - endMs / 1000).toFixed(1)) });
     maybeRenderBridge();
@@ -433,6 +447,23 @@ function openSource(songId, duration) {
 // Precarga la siguiente canción mientras suena la actual. Se dispara desde
 // player:peek-next (~90 s de antelación), así que al cambiar de tema los bytes
 // ya están en RAM y el relevo es inmediato: sin esperar a Navidrome y sin tag.
+// Deja elegida y DESCARGANDOSE la siguiente cancion de AutoDJ nada mas empezar la
+// actual. Antes esto solo ocurria si un cliente llamaba a `player:peek-next`, asi
+// que en una sesion sin PlayerView activo no habia precarga: al cambiar de tema
+// habia que bajar la cancion entera desde cero (de ahi la tardanza) y encima no
+// daba tiempo a preparar el crossfade.
+function primeNextAutoDJ() {
+  setTimeout(async () => {
+    try {
+      if (!db.getSessionActive() || !db.getAutoDJEnabled()) return;
+      if (db.getQueue().length) return;          // la cola de usuarios manda
+      if (bcastPrefetch) return;                 // ya hay una en camino
+      if (!pendingAutoDJ) pendingAutoDJ = await pickAutoDJSong();
+      if (pendingAutoDJ) prefetchBroadcast(pendingAutoDJ.id, pendingAutoDJ.duration || 0);
+    } catch (e) { console.error('primeNextAutoDJ error:', e.message); }
+  }, 1500);   // pequeño respiro: que la cancion actual arranque primero
+}
+
 function prefetchBroadcast(songId, duration) {
   if (!songId) return;
   if (bcastSongId === songId) return;                       // ya suena
@@ -860,6 +891,7 @@ async function advanceQueue({ auto = false } = {}) {
           broadcast();
           io.emit('autodj:update', { enabled: true, active: true });
           scheduleSongEnd(pick.id, pick.duration || 0); // safety net
+          primeNextAutoDJ();   // dejar lista la siguiente sin depender del cliente
           return pick;
         } catch (e) {
           slog('advance:error', { err: e.message });
@@ -886,6 +918,7 @@ async function advanceQueue({ auto = false } = {}) {
     // depende de que un cliente llegue a pedir peek-next.
     const after = db.getQueue()[0];
     if (after) prefetchBroadcast(after.id, after.duration || 0);
+    else if (db.getAutoDJEnabled()) primeNextAutoDJ();   // la cola se agota: releva AutoDJ
     autoDJActive = false;
     broadcast();
     io.emit('autodj:update', { enabled: db.getAutoDJEnabled(), active: false });
