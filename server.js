@@ -536,7 +536,7 @@ if (!existing) {
     console.error('FATAL: no hay usuario admin y ADMIN_PASSWORD no esta definido.');
     process.exit(1);
   }
-  db.createUser('admin', auth.hashPassword(process.env.ADMIN_PASSWORD), 'admin');
+  db.createUser('admin', auth.hashPasswordSync(process.env.ADMIN_PASSWORD), 'admin');
   console.log('Admin creado desde ADMIN_PASSWORD');
 }
 
@@ -546,29 +546,38 @@ const broadcast = () => {
 };
 
 // ── Auth ──────────────────────────────────────────────────────────────────────
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Faltan datos' });
   if (username.length < 3)    return res.status(400).json({ error: 'Usuario muy corto (min 3 letras)' });
   if (password.length < 4)    return res.status(400).json({ error: 'Contrasena muy corta (min 4 letras)' });
   if (username.toLowerCase() === 'admin') return res.status(409).json({ error: 'Ese nombre no esta disponible' });
   try {
-    const user  = db.createUser(username, auth.hashPassword(password), 'user');
+    const hash  = await auth.hashPassword(password);   // no bloquea el audio
+    const user  = db.createUser(username, hash, 'user');
     const token = auth.signToken(user);
     res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
   } catch (e) {
     if (e.message && e.message.includes('UNIQUE')) return res.status(409).json({ error: 'Ese nombre ya esta en uso' });
-    res.status(500).json({ error: e.message });
+    console.error('register error:', e.message);     // el detalle al log, nunca al cliente
+    res.status(500).json({ error: 'Error interno del servidor' });
   }
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
-  const user = db.getUserByUsername(username);
-  if (!user || !auth.verifyPassword(password, user.password_hash))
-    return res.status(401).json({ error: 'Usuario o contrasena incorrectos' });
-  const token = auth.signToken(user);
-  res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+  try {
+    const user = db.getUserByUsername(username);
+    const ok = user && typeof password === 'string'
+      ? await auth.verifyPassword(password, user.password_hash)
+      : false;
+    if (!ok) return res.status(401).json({ error: 'Usuario o contrasena incorrectos' });
+    const token = auth.signToken(user);
+    res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+  } catch (e) {
+    console.error('login error:', e.message);
+    res.status(500).json({ error: 'Error interno del servidor' });
+  }
 });
 
 app.get('/api/auth/me', auth.authMiddleware, (req, res) => res.json(req.user));
@@ -1285,4 +1294,4 @@ if (db.getSessionActive()) {
 }
 
 const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => console.log('TuriaDJ on port', PORT));
+server.listen(PORT, () => console.log('TuriaDJ on port', PORT, '| bcrypt:', auth.bcryptImpl));
