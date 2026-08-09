@@ -974,21 +974,28 @@ export default function UnifiedView() {
       fetch('/api/session/status').then(r => r.json()).then(({ active, name, desc }) => {
         setSessionActive(active); setSessionName(name || ''); setSessionDesc(desc || '');
       }).catch(() => setSessionActive(prev => prev === null ? false : prev));
-      if (currentUser?.role !== 'admin') return; // el resto solo aplica al admin
+
+      // Cancion actual y cola TAMBIEN por HTTP para todos los roles. Antes los
+      // votantes salian aqui y dependian por completo del socket: si en su movil
+      // el socket no entrega (pasa), veian "Sin reproducir" y la cola vacia de
+      // forma permanente aunque el servidor estuviese emitiendo con normalidad.
+      const esAdmin = currentUser?.role === 'admin';
       fetch('/api/now-playing').then(r => r.json()).then(song => {
-        if (!song) return;
+        if (!song) { if (!esAdmin) setNowPlaying(null); return; }
+        setNowPlaying(song);
+        if (!esAdmin) return;                 // el voter no reproduce por /api/stream
         const active = getActive();
         const desiredSrc = '/api/stream/' + song.id;
         if (active && (!active.src || !active.src.endsWith(desiredSrc))) {
           cancelAnimationFrame(crossfadeRaf.current);
           fadeScheduled.current = false;
-          setNowPlaying(song);
           loadAndPlay(song);
         } else if (active && active.paused) {
           active.play().then(() => setIsPlaying(true)).catch(() => {});
         }
       }).catch(() => {});
       authFetch('/api/queue').then(r => r.json()).then(setQueue).catch(() => {});
+      if (!esAdmin) return;                   // lo que queda es solo del admin
       fetch('/api/autodj/status').then(r => r.json())
         .then(({ enabled, active }) => { setAutoDJEnabled(enabled); setAutoDJActive(active); }).catch(() => {});
     };
@@ -1600,7 +1607,10 @@ export default function UnifiedView() {
 
   useEffect(() => {
     if (isAdmin) return;
-    const onWake = () => recoverRef.current();
+    const onWake = () => {
+      recoverRef.current();
+      if (!document.hidden) resyncAllRef.current?.();   // tambien el estado, no solo el audio
+    };
     document.addEventListener('visibilitychange', onWake);
     window.addEventListener('focus', onWake);
     window.addEventListener('pageshow', onWake);
@@ -1610,6 +1620,17 @@ export default function UnifiedView() {
       window.removeEventListener('pageshow', onWake);
     };
   }, [isAdmin]);
+
+  // Red de seguridad para el votante: refresco periodico por HTTP. Su socket ha
+  // demostrado no ser fiable en movil, y sin esto la pantalla se queda congelada
+  // ("Sin reproducir", cola vacia) aunque el servidor este emitiendo.
+  useEffect(() => {
+    if (isAdmin || !currentUser) return;
+    const id = setInterval(() => {
+      if (!document.hidden) resyncAllRef.current?.();
+    }, 15000);
+    return () => clearInterval(id);
+  }, [isAdmin, currentUser]);
 
   // Vigilante: iOS puede pausar el audio sin emitir visibilitychange. Si con la
   // pestaña visible el reloj del <audio> deja de avanzar, se reabre el stream.
