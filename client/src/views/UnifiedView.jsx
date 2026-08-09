@@ -188,8 +188,8 @@ function AdminDashboard({
 
   // Control tab
   const [volume,           setVolume]          = useState(100);
-  const [threshold,        setThreshold]        = useState(silenceConfig?.threshold ?? 0.02);
-  const [silSecs,          setSilSecs]          = useState(silenceConfig?.seconds ?? 1);
+  const [dropDb,           setDropDb]           = useState(silenceConfig?.dropDb ?? 12);
+  const [maxCut,           setMaxCut]           = useState(silenceConfig?.maxCut ?? 20);
   const [crossfadeSecs,    setCrossfadeSecs]    = useState((crossfadeConfig?.ms ?? 4000) / 1000);
   const [silenceSaving,    setSilenceSaving]    = useState(false);
   const [silenceSaved,     setSilenceSaved]     = useState(false);
@@ -268,7 +268,7 @@ function AdminDashboard({
   const clearChat     = () => { socket.emit('chat:clear'); setClearChatConfirm(false); };
   const saveSilence   = async () => {
     setSilenceSaving(true);
-    await authFetch('/api/player/silence-config', { method: 'POST', body: JSON.stringify({ threshold, seconds: silSecs }) });
+    await authFetch('/api/player/silence-config', { method: 'POST', body: JSON.stringify({ dropDb, maxCut }) });
     setSilenceSaving(false); setSilenceSaved(true); setTimeout(() => setSilenceSaved(false), 2000);
   };
   const saveCrossfade = async (secs) => {
@@ -495,24 +495,30 @@ function AdminDashboard({
 
             <div className="border-t border-gray-800/50" />
 
-            {/* Silence threshold */}
+            {/* Recorte del final muerto de la cancion (lo calcula el servidor) */}
+            <p className="text-[11px] text-gray-600 leading-snug -mt-1">
+              Recorta el final muerto de cada cancion (fade o silencio) para que el
+              crossfade entre con musica. Se aplica igual en la sala y en los moviles.
+            </p>
             <div>
               <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Umbral de amplitud (silencio)</span>
-                <span className="font-mono text-gray-300">{threshold.toFixed(3)}</span>
+                <span>Umbral del recorte</span>
+                <span className="font-mono text-gray-300">−{dropDb} dB</span>
               </div>
-              <input type="range" min={0.005} max={0.08} step={0.005} value={threshold} onChange={e => setThreshold(Number(e.target.value))}
+              <input type="range" min={4} max={24} step={1} value={dropDb} onChange={e => setDropDb(Number(e.target.value))}
                 className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer" />
-              <div className="flex justify-between text-xs text-gray-700 mt-1"><span>sensible</span><span>tolerante</span></div>
+              {/* OJO: valor BAJO = umbral alto = recorta MAS. Medido sobre "Chulo":
+                  -6 dB recorta 9 s, -12 dB recorta 8 s, -20 dB solo 2,7 s. */}
+              <div className="flex justify-between text-xs text-gray-700 mt-1"><span>recorta mas</span><span>recorta menos</span></div>
             </div>
             <div>
               <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Segundos de silencio antes de avanzar</span>
-                <span className="font-mono text-gray-300">{silSecs.toFixed(1)} s</span>
+                <span>Recorte maximo por cancion</span>
+                <span className="font-mono text-gray-300">{maxCut} s</span>
               </div>
-              <input type="range" min={0.5} max={5} step={0.5} value={silSecs} onChange={e => setSilSecs(Number(e.target.value))}
+              <input type="range" min={0} max={30} step={1} value={maxCut} onChange={e => setMaxCut(Number(e.target.value))}
                 className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer" />
-              <div className="flex justify-between text-xs text-gray-700 mt-1"><span>rápido</span><span>conservador</span></div>
+              <div className="flex justify-between text-xs text-gray-700 mt-1"><span>0 s (desactivado)</span><span>30 s</span></div>
             </div>
             <button onClick={saveSilence} disabled={silenceSaving}
               className="w-full py-2.5 bg-gray-800 hover:bg-gray-700 disabled:opacity-50 text-gray-200 rounded-xl text-sm font-semibold transition-colors">
@@ -988,7 +994,7 @@ export default function UnifiedView() {
   const [autoDJActive,  setAutoDJActive]  = useState(false);
   const [onlineUsers,   setOnlineUsers]   = useState({ count: 0, users: [] });
   const [showOnlinePanel, setShowOnlinePanel] = useState(false);
-  const [silenceConfig,   setSilenceConfig]   = useState({ threshold: 0.02, seconds: 1 });
+  const [silenceConfig,   setSilenceConfig]   = useState({ dropDb: 12, maxCut: 20 });
   const [crossfadeConfig, setCrossfadeConfig] = useState({ ms: 4000 });
   const [chatMessages,  setChatMessages]  = useState([]);
   const [chatEnabled,   setChatEnabled]   = useState(true);
@@ -1131,7 +1137,7 @@ export default function UnifiedView() {
     authFetch('/api/playlists').then(r => r.json()).then(setPlaylists).catch(() => {});
     authFetch('/api/queue/my-votes').then(r => r.json())
       .then(ids => setVotedSongs(new Set(ids))).catch(() => {});
-    socket.on('player:silence-config', ({ threshold, seconds }) => setSilenceConfig({ threshold, seconds }));
+    socket.on('player:silence-config', (c) => setSilenceConfig({ dropDb: c.dropDb ?? 12, maxCut: c.maxCut ?? 20 }));
     socket.on('player:crossfade-config', ({ ms }) => { if (ms > 0) setCrossfadeConfig({ ms }); });
     socket.on('chat:history', ({ messages, enabled }) => { setChatMessages(messages); setChatEnabled(enabled); });
     socket.on('chat:message', msg => {
@@ -1466,8 +1472,13 @@ export default function UnifiedView() {
     // del final para garantizar solapamiento real. Funciona con cola Y AutoDJ.
     const crossfadeSecs = (crossfadeConfig.ms || 4000) / 1000;
     const preTrigger    = crossfadeSecs + 1;
-    if (isAdmin && dur > preTrigger && dur - ct <= preTrigger && !fadeScheduled.current) {
-      console.log(`[crossfade] pre-trigger at ${(dur-ct).toFixed(2)}s remaining (preTrigger=${preTrigger}s, queue=${queue.length}, autoDJ=${autoDJEnabled})`);
+    // Final REAL de la musica, calculado por el servidor: si la cancion acaba en
+    // un fade o en silencio, el crossfade arranca ahi y la sala no se come esa
+    // cola muerta. Sin este dato se usa la duracion del fichero, como antes.
+    const finMusica = nowPlaying?.audioEndMs ? nowPlaying.audioEndMs / 1000 : dur;
+    const limite    = Math.min(dur, finMusica);
+    if (isAdmin && limite > preTrigger && limite - ct <= preTrigger && !fadeScheduled.current) {
+      console.log(`[crossfade] pre-trigger a ${(limite-ct).toFixed(2)}s del final util (preTrigger=${preTrigger}s, finMusica=${finMusica.toFixed(1)}s, dur=${dur.toFixed(1)}s)`);
       fadeScheduled.current = true;
       if (queue.length > 0) {
         triggerCrossfade(queue);

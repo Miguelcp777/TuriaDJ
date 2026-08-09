@@ -262,9 +262,18 @@ const BRIDGE_MAX_BYTES = 6 * 1024 * 1024;
 // de su media -> el solapamiento habria sido inaudible. Aqui se toma el RMS en
 // ventanas de ~1 s y se busca la ultima que supere (media - TAIL_DROP_DB). Con
 // eso "Chulo" recorta 7,6 s de fade y entra en la mezcla a -9,1 dB (nivel pleno).
-const TAIL_DROP_DB  = 12;
 const TAIL_SCAN_SEC = 100;                 // solo se analiza el final de la cancion
 const audioEndCache = new Map();           // songId -> endMs (las canciones se repiten)
+
+// Los dos mandos del panel admin. `dropDb`: cuantos dB por debajo del nivel de la
+// propia cancion se deja de considerar musica (subirlo recorta mas fade, bajarlo
+// es mas conservador). `maxCut`: tope de seguridad en segundos.
+function silenceConfig() {
+  return {
+    dropDb: parseFloat(db.getSetting('silence_drop_db') || 12),
+    maxCut: parseFloat(db.getSetting('silence_max_cut') || 20),
+  };
+}
 
 function detectAudioEnd(src, songId, durationSec) {
   if (!durationSec || durationSec < 20) return;
@@ -294,14 +303,15 @@ function detectAudioEnd(src, songId, durationSec) {
       // no valdria, porque si el tramo es mayoritariamente fade la media ya es baja.
       const ord = [...v].sort((a, b) => a - b);
       const refDb = ord[Math.floor(ord.length * 0.75)];
-      const th  = refDb - TAIL_DROP_DB;
+      const cfg = silenceConfig();
+      const th  = refDb - cfg.dropDb;                   // mando del panel admin
       const win = (durationSec - from) / v.length;      // el tramo empieza en `from`
       let last = v.length - 1;
       while (last > 0 && v[last] < th) last--;
       endMs = Math.min(durationSec, from + (last + 1) * win) * 1000;
-      // Nunca recortar mas del 20% ni mas de 20 s: hay outros largos y tranquilos
-      // que siguen siendo musica y no deben perderse.
-      const maxCut = Math.min(20000, durationSec * 1000 * 0.2);
+      // Topes de seguridad: nunca recortar mas de lo configurado ni mas del 20%
+      // de la cancion (hay outros largos y tranquilos que siguen siendo musica).
+      const maxCut = Math.min(cfg.maxCut * 1000, durationSec * 1000 * 0.2);
       if (durationSec * 1000 - endMs > maxCut) endMs = durationSec * 1000 - maxCut;
     }
     src.audioEndMs = endMs;
@@ -309,6 +319,11 @@ function detectAudioEnd(src, songId, durationSec) {
     if (audioEndCache.size > 400) audioEndCache.delete(audioEndCache.keys().next().value);
     if (endMs < durationSec * 1000 - 200)
       slog('broadcast:tailCut', { id: songId.slice(0, 8), cut: +((durationSec - endMs / 1000).toFixed(1)) });
+    // El analisis tarda unos segundos: cuando acaba hay que reenviar la cancion
+    // para que el reproductor de la sala conozca ya el final real y adelante ahi
+    // su crossfade. Sin esto solo se enteraria a partir del tema siguiente.
+    const actual = db.getNowPlaying();
+    if (actual && actual.id === songId) io.emit('player:update', nowPlayingConAudioEnd());
     maybeRenderBridge();
   });
   setTimeout(() => { try { ff.kill('SIGKILL'); } catch(e) {} }, 60000);
@@ -622,9 +637,23 @@ function syncNextUp() {
   if (!bcastPrefetch && bcastSongId !== esperado) prefetchBroadcast(esperado, nextUpDuration());
 }
 
+// La canción que se manda al cliente lleva `audioEndMs`: el punto donde acaba la
+// MUSICA segun el detector del servidor. El reproductor de la sala lo usa para
+// arrancar el crossfade ahi en vez de al final del fichero, asi que deja de sonar
+// el silencio de cola. Es el mismo criterio que se aplica a los oyentes de
+// /api/live, de modo que sala y moviles se comportan igual.
+function nowPlayingConAudioEnd() {
+  const song = db.getNowPlaying();
+  if (!song) return null;
+  const fin = (bcastSource && bcastSource.songId === song.id && bcastSource.audioEndMs)
+    ? bcastSource.audioEndMs
+    : audioEndCache.get(song.id);
+  return fin ? { ...song, audioEndMs: fin } : song;
+}
+
 const broadcast = () => {
   io.emit('queue:update',  db.getQueue());
-  io.emit('player:update', db.getNowPlaying());
+  io.emit('player:update', nowPlayingConAudioEnd());
   try { syncNextUp(); } catch (e) { console.error('syncNextUp error:', e.message); }
 };
 
@@ -920,14 +949,26 @@ app.delete('/api/queue', auth.adminMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
+// Config del recorte de cola. Antes gobernaba un detector por RMS que corria en
+// el navegador y, medido sobre la biblioteca real, apenas adelantaba 0,2-1,4 s:
+// el pre-trigger del crossfade se le adelantaba en 7 de 8 canciones, y en el
+// panel admin ni siquiera existia ese detector. Ahora estos dos mandos controlan
+// el detector del servidor (detectAudioEnd), que mide en ventanas de RMS con un
+// umbral RELATIVO al nivel de cada cancion y recorta 2-8 s.
 app.post('/api/player/silence-config', auth.adminMiddleware, (req, res) => {
-  const { threshold, seconds } = req.body;
-  if (threshold !== undefined) db.setSetting('silence_threshold', threshold);
-  if (seconds   !== undefined) db.setSetting('silence_seconds',   seconds);
-  const data = {
-    threshold: parseFloat(db.getSetting('silence_threshold') || 0.02),
-    seconds:   parseFloat(db.getSetting('silence_seconds')   || 1),
-  };
+  const { dropDb, maxCut } = req.body || {};
+  if (dropDb !== undefined) db.setSetting('silence_drop_db', Math.max(4, Math.min(30, parseFloat(dropDb) || 12)));
+  if (maxCut !== undefined) db.setSetting('silence_max_cut', Math.max(0, Math.min(30, parseFloat(maxCut) || 20)));
+  const data = silenceConfig();
+  // La cache guarda finales calculados con el umbral ANTERIOR: hay que tirarla y
+  // recalcular la cancion en curso, o el cambio no se notaria hasta la siguiente.
+  audioEndCache.clear();
+  bcastBridge = null;
+  if (bcastSource && bcastSource.songId && !bcastSource.isBridge) {
+    bcastSource.audioEndMs = null;
+    detectAudioEnd(bcastSource, bcastSource.songId, bcastSource.durationSec || 0);
+  }
+  slog('silence:config', data);
   io.emit('player:silence-config', data);
   res.json({ success: true, ...data });
 });
@@ -940,7 +981,7 @@ app.post('/api/player/crossfade-config', auth.adminMiddleware, (req, res) => {
   res.json({ success: true, ms: crossfadeMs });
 });
 
-app.get('/api/now-playing', (req, res) => { const song = db.getNowPlaying(); res.json(song ? { ...song, position: lastProgress.position } : null); });
+app.get('/api/now-playing', (req, res) => { const song = nowPlayingConAudioEnd(); res.json(song ? { ...song, position: lastProgress.position } : null); });
 
 // ── advanceQueue: lógica de avance compartida entre HTTP y socket ─────────────
 // Protección contra doble avance:
@@ -1325,7 +1366,7 @@ function slog(event, data = {}) {
 
 io.on('connection', socket => {
   socket.emit('queue:update',   db.getQueue());
-  socket.emit('player:update',  db.getNowPlaying());
+  socket.emit('player:update',  nowPlayingConAudioEnd());
   socket.emit('session:update', { active: db.getSessionActive(), name: db.getSessionName(), desc: db.getSessionDesc() });
   socket.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: autoDJActive });
   const storedEnd = db.getSetting('session_end_time');
@@ -1418,10 +1459,7 @@ io.on('connection', socket => {
   socket.emit('session:log:init', sessionLog);
 
   // Silence config: send persisted values to new connection
-  socket.emit('player:silence-config', {
-    threshold: parseFloat(db.getSetting('silence_threshold') || 0.02),
-    seconds:   parseFloat(db.getSetting('silence_seconds')   || 1),
-  });
+  socket.emit('player:silence-config', silenceConfig());
 
   // Crossfade config: send persisted value to new connection
   socket.emit('player:crossfade-config', {
