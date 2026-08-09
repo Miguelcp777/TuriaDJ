@@ -53,6 +53,7 @@ NAVIDROME_USER=usuario_servicio            # Usuario Subsonic
 NAVIDROME_PASS=contraseña_servicio         # Contraseña Subsonic
 ALLOWED_ORIGIN=https://tu-dominio.com      # CORS de Socket.IO
 SPOOTY_URL=http://localhost:3000           # URL del servicio Spooty (descarga Spotify)
+GOOGLE_CLIENT_ID=<id>.apps.googleusercontent.com   # OPCIONAL — acceso con Google
 PORT=3001                                  # Puerto del servidor
 DATA_DIR=./data                            # Directorio de la base de datos SQLite
 ```
@@ -446,6 +447,7 @@ También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-08-09 | **Acceso con cuenta de Google** — botón junto al formulario de siempre, que sigue funcionando. Flujo de *ID token*: el servidor verifica el JWT con `google-auth-library` (firma, emisor y audiencia); **no hay client secret que custodiar**. Se exige `email_verified`. Alta automática al primer acceso, vinculando por email si la cuenta ya existía. ⚠️ `password_hash` es NOT NULL y SQLite no deja quitarlo sin reconstruir la tabla: las cuentas de Google guardan un centinela `google:<aleatorio>` y el login por contraseña **rechaza explícitamente** lo que no empiece por `$2`. Todo inactivo si falta `GOOGLE_CLIENT_ID`. |
 | 2026-08-09 | **`bcrypt` nativo** — 60 logins simultáneos dejaban ~4,75 s sin audio a todos los oyentes (bcrypt bloquea el hilo que emite). ⚠️ Pasar de `compareSync` a `compare` NO arregla nada: `bcryptjs` es JS puro y su API asíncrona solo trocea el trabajo en el mismo hilo. El fix es `bcrypt` nativo, que usa el threadpool de libuv. Retraso máximo del emisor: 5347 ms → **2 ms**. `bcryptjs` queda como respaldo; los hashes son compatibles en ambos sentidos. |
 | 2026-08-09 | **Ritmo del broadcast por ms de audio, no por bytes** — `bcastBPS = fileSize/duration` se desviaba con VBR y despachaba 110 s de audio en ~85 s, dejando ~25 s mudos antes de cada cambio. ⚠️ No lo detecté antes porque las pruebas usaban avances forzados y ninguna canción llegaba a agotarse: **al probar el motor, dejar que la canción termine sola**. |
 | 2026-08-09 | **Crossfade de servidor con detección del final audible** — `silencedetect` NO sirve para esto (exige nivel bajo *continuo*, y un fade con golpes sueltos lo resetea). Se usa RMS por ventana de ~1 s buscando la última que supere la media −12 dB. Solapamiento mínimo 3 s. Interruptor en caliente: `POST /api/player/server-crossfade`. |
