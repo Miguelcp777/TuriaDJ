@@ -34,6 +34,54 @@ function AuthModal({ onAuth }) {
   const [showPw2, setShowPw2]     = useState(false);
   const [error, setError]         = useState('');
   const [loading, setLoading]     = useState(false);
+  const [googleReady, setGoogleReady] = useState(false);
+  const [googleError, setGoogleError] = useState('');
+  const googleBtnRef = useRef(null);
+
+  // ── Acceso con Google ──────────────────────────────────────────────────────
+  // Se pregunta al servidor si esta configurado; si no lo esta, no se carga nada
+  // de Google y la pantalla se queda como siempre. El script viene de un dominio
+  // externo, asi que si el wifi lo bloquea simplemente no aparece el boton y el
+  // formulario de usuario/contrasena sigue funcionando.
+  useEffect(() => {
+    let cancelado = false;
+    fetch('/api/auth/google/config')
+      .then(r => r.json())
+      .then(({ enabled, clientId }) => {
+        if (cancelado || !enabled || !clientId) return;
+        const pintar = () => {
+          if (cancelado || !window.google?.accounts?.id || !googleBtnRef.current) return;
+          window.google.accounts.id.initialize({
+            client_id: clientId,
+            callback: async ({ credential }) => {
+              setGoogleError('');
+              try {
+                const r = await fetch('/api/auth/google', {
+                  method: 'POST', headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ credential })
+                });
+                const data = await r.json();
+                if (data.token) onAuth(data.token, data.user);
+                else setGoogleError(data.error || 'No se pudo entrar con Google');
+              } catch { setGoogleError('Error de conexion'); }
+            }
+          });
+          window.google.accounts.id.renderButton(googleBtnRef.current,
+            { theme: 'filled_black', size: 'large', text: 'continue_with',
+              shape: 'pill', locale: 'es', width: 280 });
+          setGoogleReady(true);
+        };
+        if (window.google?.accounts?.id) return pintar();
+        const s = document.createElement('script');
+        s.src = 'https://accounts.google.com/gsi/client';
+        s.async = true; s.defer = true;
+        s.onload = pintar;
+        s.onerror = () => { /* sin conexion con Google: se queda el formulario */ };
+        document.head.appendChild(s);
+      })
+      .catch(() => {});
+    return () => { cancelado = true; };
+  }, []);
 
   const submit = async () => {
     if (!username.trim() || !password) return setError('Rellena todos los campos');
@@ -63,6 +111,19 @@ function AuthModal({ onAuth }) {
           <h1 className="text-3xl font-extrabold tracking-tight">TuriaDJ</h1>
           <p className="text-xs text-red-400 font-semibold uppercase tracking-widest mt-1">Falla Turia · Plaça de l'Ajuntament</p>
         </div>
+        {/* Acceso con Google. Solo aparece si el servidor tiene GOOGLE_CLIENT_ID
+            configurado; si no, la pantalla queda exactamente como estaba. */}
+        {googleReady && (
+          <div className="mb-5">
+            <div ref={googleBtnRef} className="flex justify-center [color-scheme:light]" />
+            {googleError && <p className="text-red-400 text-xs text-center mt-2">{googleError}</p>}
+            <div className="flex items-center gap-3 mt-5">
+              <div className="flex-1 h-px bg-gray-800" />
+              <span className="text-[11px] text-gray-600 uppercase tracking-widest">o</span>
+              <div className="flex-1 h-px bg-gray-800" />
+            </div>
+          </div>
+        )}
         <div className="flex bg-gray-900 rounded-2xl p-1 mb-6">
           {['login','register'].map(t => (
             <button key={t} onClick={() => { setTab(t); setError(''); setPassword2(''); }}

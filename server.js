@@ -5,6 +5,7 @@ const { Server } = require('socket.io');
 const path     = require('path');
 const axios    = require('axios');
 const { spawn } = require('child_process');
+const crypto   = require('crypto');
 const db       = require('./db');
 const nd       = require('./navidrome');
 const auth     = require('./auth');
@@ -650,10 +651,18 @@ app.post('/api/auth/login', async (req, res) => {
   const { username, password } = req.body || {};
   try {
     const user = db.getUserByUsername(username);
-    const ok = user && typeof password === 'string'
+    // Las cuentas creadas con Google llevan un centinela en password_hash, no un
+    // hash bcrypt. Se rechazan aqui explicitamente en vez de dejarselo a bcrypt.
+    const esCuentaConPassword = !!user && typeof user.password_hash === 'string'
+                                && user.password_hash.startsWith('$2');
+    const ok = esCuentaConPassword && typeof password === 'string'
       ? await auth.verifyPassword(password, user.password_hash)
       : false;
-    if (!ok) return res.status(401).json({ error: 'Usuario o contrasena incorrectos' });
+    if (!ok) {
+      if (user && !esCuentaConPassword)
+        return res.status(401).json({ error: 'Esta cuenta entra con Google' });
+      return res.status(401).json({ error: 'Usuario o contrasena incorrectos' });
+    }
     const token = auth.signToken(user);
     res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
   } catch (e) {
@@ -663,6 +672,75 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 app.get('/api/auth/me', auth.authMiddleware, (req, res) => res.json(req.user));
+
+// ── Google Sign-In ───────────────────────────────────────────────────────────
+// Flujo de ID token: el movil obtiene de Google un JWT firmado y nos lo manda.
+// El servidor lo verifica contra las claves publicas de Google (firma, emisor y
+// audiencia). NO se confia en nada que venga del cliente sin verificar, y no
+// hace falta custodiar ningun "client secret".
+// Queda inactivo mientras GOOGLE_CLIENT_ID no este definido en .env.
+let googleClient = null;
+if (process.env.GOOGLE_CLIENT_ID) {
+  try {
+    const { OAuth2Client } = require('google-auth-library');
+    googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+    console.log('Google Sign-In activado');
+  } catch (e) {
+    console.error('Google Sign-In NO disponible (falta google-auth-library):', e.message);
+  }
+}
+
+// El cliente pregunta si debe pintar el boton, y con que ID.
+app.get('/api/auth/google/config', (req, res) =>
+  res.json({ enabled: !!googleClient, clientId: process.env.GOOGLE_CLIENT_ID || null }));
+
+// Deriva un nombre visible libre a partir del perfil de Google.
+function usernameLibre(base) {
+  let limpio = String(base || '').trim().replace(/\s+/g, ' ').slice(0, 20);
+  if (limpio.length < 3) limpio = 'invitado';
+  if (limpio.toLowerCase() === 'admin') limpio = 'invitado';
+  if (!db.usernameTaken(limpio)) return limpio;
+  for (let i = 2; i < 200; i++) {
+    const cand = limpio.slice(0, 17) + ' ' + i;
+    if (!db.usernameTaken(cand)) return cand;
+  }
+  return 'invitado ' + crypto.randomUUID().slice(0, 6);
+}
+
+app.post('/api/auth/google', async (req, res) => {
+  if (!googleClient) return res.status(503).json({ error: 'Acceso con Google no configurado' });
+  const { credential } = req.body || {};
+  if (!credential) return res.status(400).json({ error: 'Falta el token de Google' });
+  try {
+    const ticket = await googleClient.verifyIdToken({
+      idToken: credential,
+      audience: process.env.GOOGLE_CLIENT_ID,   // el token debe ser PARA esta app
+    });
+    const p = ticket.getPayload();
+    // Un email sin verificar podria ser de otra persona: no vale para vincular.
+    if (!p || !p.sub || !p.email || p.email_verified !== true)
+      return res.status(401).json({ error: 'Cuenta de Google no verificada' });
+
+    let user = db.getUserByGoogleSub(p.sub);
+    if (!user) {
+      const previo = db.getUserByEmail(p.email);
+      if (previo) {                     // ya existia con ese email: se vincula
+        db.linkGoogle(previo.id, p.sub, p.email);
+        user = db.getUserByUsername(previo.username);
+        slog('auth:googleLink', { user: previo.username.slice(0, 16) });
+      } else {
+        const nombre = usernameLibre(p.given_name || p.name || String(p.email).split('@')[0]);
+        user = db.createGoogleUser(nombre, p.sub, p.email);
+        slog('auth:googleNuevo', { user: nombre.slice(0, 16) });
+      }
+    }
+    const token = auth.signToken(user);
+    res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
+  } catch (e) {
+    console.error('google login error:', e.message);
+    res.status(401).json({ error: 'No se pudo validar la cuenta de Google' });
+  }
+});
 
 // ── Admin user management ─────────────────────────────────────────────────────
 app.get('/api/admin/users', auth.adminMiddleware, (req, res) => {

@@ -37,6 +37,16 @@ const queueCols = db.prepare('PRAGMA table_info(queue)').all().map(c => c.name);
 if (!queueCols.includes('first_voted_at')) db.exec('ALTER TABLE queue ADD COLUMN first_voted_at DATETIME');
 if (!queueCols.includes('priority'))       db.exec('ALTER TABLE queue ADD COLUMN priority INTEGER DEFAULT 0');
 
+// Google Sign-In (2026-08-09). `password_hash` es NOT NULL y SQLite no permite
+// quitar esa restriccion sin reconstruir la tabla, cosa que no merece el riesgo:
+// las cuentas de Google guardan ahi un centinela 'google:<aleatorio>' que NO es
+// un hash bcrypt valido. El login por contrasena lo rechaza explicitamente (ver
+// server.js), asi que nunca puede usarse para entrar.
+const userCols = db.prepare('PRAGMA table_info(users)').all().map(c => c.name);
+if (!userCols.includes('google_sub')) db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT');
+if (!userCols.includes('email'))      db.exec('ALTER TABLE users ADD COLUMN email TEXT');
+db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL');
+
 module.exports = {
   // ── users ──────────────────────────────────────────────────────────────────
   createUser(username, passwordHash, role = 'user') {
@@ -46,6 +56,23 @@ module.exports = {
   },
   getUserByUsername: (u) => db.prepare('SELECT * FROM users WHERE username=?').get(u),
   getUserById:       (id) => db.prepare('SELECT id,username,role FROM users WHERE id=?').get(id),
+
+  // ── Google Sign-In ─────────────────────────────────────────────────────────
+  getUserByGoogleSub: (sub) => db.prepare('SELECT * FROM users WHERE google_sub=?').get(sub),
+  // Comparacion sin distinguir mayusculas: Google devuelve el email en minusculas,
+  // pero una cuenta creada a mano pudo guardarlo de otra forma.
+  getUserByEmail: (mail) => db.prepare('SELECT * FROM users WHERE email IS NOT NULL AND lower(email)=lower(?)').get(mail),
+  linkGoogle: (id, sub, email) =>
+    db.prepare('UPDATE users SET google_sub=?, email=COALESCE(email,?) WHERE id=?').run(sub, email, id),
+  createGoogleUser(username, sub, email, role = 'user') {
+    const id = crypto.randomUUID();
+    // Centinela: no es un hash bcrypt, asi que jamas validara como contrasena.
+    const sentinel = 'google:' + crypto.randomBytes(32).toString('hex');
+    db.prepare('INSERT INTO users (id,username,password_hash,role,google_sub,email) VALUES (?,?,?,?,?,?)')
+      .run(id, username, sentinel, role, sub, email);
+    return { id, username, role };
+  },
+  usernameTaken: (u) => !!db.prepare('SELECT 1 FROM users WHERE lower(username)=lower(?)').get(u),
   getUsers:          ()  => db.prepare('SELECT id,username,role,created_at FROM users ORDER BY created_at ASC').all(),
   updateUserRole:    (id, role) => db.prepare('UPDATE users SET role=? WHERE id=?').run(role, id),
   deleteUser:        (id) => db.prepare('DELETE FROM users WHERE id=?').run(id),
