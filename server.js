@@ -414,10 +414,10 @@ function maybeRenderBridge() {
 // Abre el stream de una canción en Navidrome y va llenando un sink (que descarta
 // el tag ID3 inicial). No toca el estado de emisión: sirve tanto para la canción
 // en curso como para precargar la siguiente.
-function openSource(songId, duration) {
-  const src = { songId, durationSec: duration, emittedMs: 0,
+function openSource(songId, duration, offsetSec = 0) {
+  const src = { songId, durationSec: duration, emittedMs: 0, offsetSec,
                 sink: makeSink(), bps: 16000, upstream: null, ready: false, failed: false };
-  axios.get(nd.streamUrl(songId), { responseType: 'stream', timeout: 15000 })
+  axios.get(nd.streamUrl(songId, offsetSec), { responseType: 'stream', timeout: 15000 })
     .then(upstream => {
       if (src.cancelled) { try { upstream.data.destroy(); } catch(e) {} return; }
       const fileSize = parseInt(upstream.headers['content-length'] || '0');
@@ -476,8 +476,8 @@ function prefetchBroadcast(songId, duration) {
   maybeRenderBridge();
 }
 
-function startBroadcast(songId, duration) {
-  slog('broadcast:start', { id: songId.slice(0, 8), dur: duration });
+function startBroadcast(songId, duration, offsetSec = 0) {
+  slog('broadcast:start', { id: songId.slice(0, 8), dur: duration, ...(offsetSec ? { desde: Math.round(offsetSec) } : {}) });
   // Idempotencia: se ignora el arranque solo si esa misma canción sigue VIVA en
   // emisión (o estamos mezclando hacia ella). Si la fuente ya se agotó hay que
   // reiniciar de verdad — un guard que mirase únicamente el id dejaba el audio
@@ -499,13 +499,15 @@ function startBroadcast(songId, duration) {
   // Relevo: si la precarga es justo esta canción, promocionarla. El audio ya está
   // en RAM y sin tag ID3, así que el cambio no deja hueco.
   let src;
-  if (bcastPrefetch && bcastPrefetch.songId === songId && !bcastPrefetch.failed) {
+  // La precarga solo sirve si se arranca desde el principio; al reanudar a mitad
+  // de cancion (offsetSec) hay que abrir la fuente en el punto correcto.
+  if (!offsetSec && bcastPrefetch && bcastPrefetch.songId === songId && !bcastPrefetch.failed) {
     src = bcastPrefetch;
     slog('broadcast:usePrefetch', { id: songId.slice(0, 8), buffered: src.sink.out.length });
   } else {
     if (bcastPrefetch) { bcastPrefetch.cancelled = true;
                          try { bcastPrefetch.upstream?.destroy(); } catch(e) {} }
-    src = openSource(songId, duration);
+    src = openSource(songId, duration, offsetSec);
   }
   bcastPrefetch = null;
 
@@ -1225,7 +1227,22 @@ io.on('connection', socket => {
   socket.on('player:cmd',   cmd  => socket.broadcast.emit('player:cmd', cmd));
   socket.on('player:state', data => socket.broadcast.emit('player:state', data));
 
-  socket.on('player:progress', data => { lastProgress = data || { position: 0 }; socket.broadcast.emit('player:progress', data); });
+  socket.on('player:progress', data => {
+    lastProgress = data || { position: 0 };
+    // Reanudacion tras reiniciar el servicio a mitad de cancion. startBroadcast
+    // solo se llamaba al AVANZAR de tema, asi que los oyentes de /api/live se
+    // quedaban mudos hasta el siguiente cambio — con una cancion larga, minutos.
+    // El reproductor reporta su posicion cada poco, asi que la usamos para
+    // retomar la emision justo donde va la sala.
+    if (!bcastSource && db.getSessionActive() && data && data.position > 1) {
+      const np = db.getNowPlaying();
+      if (np && np.id) {
+        slog('broadcast:resume', { id: np.id.slice(0, 8), pos: Math.round(data.position) });
+        startBroadcast(np.id, np.duration || 0, data.position);
+      }
+    }
+    socket.broadcast.emit('player:progress', data);
+  });
 
   // Avance automático desde PlayerView — sin auth, el servidor valida que haya sesión activa
   socket.on('player:auto-next', async (_, cb) => {

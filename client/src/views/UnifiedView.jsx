@@ -914,6 +914,7 @@ export default function UnifiedView() {
   const [voterListening, setVoterListening] = useState(false);
   const [voterLoading,   setVoterLoading]   = useState(false);
   const [voterNeedsTap,  setVoterNeedsTap]  = useState(false);  // play() bloqueado por el navegador
+  const [voterStalled,   setVoterStalled]   = useState(false);  // el servidor no envia audio
   // Espejo en ref: el efecto del socket tiene deps [authToken, currentUser] y no
   // se re-registra al cambiar voterListening — sus handlers leerían un valor obsoleto.
   const voterListeningRef = useRef(false);
@@ -1612,16 +1613,23 @@ export default function UnifiedView() {
 
   // Vigilante: iOS puede pausar el audio sin emitir visibilitychange. Si con la
   // pestaña visible el reloj del <audio> deja de avanzar, se reabre el stream.
+  // OJO con reintentar sin freno: si el servidor no esta emitiendo (p. ej. tras
+  // reiniciarlo a mitad de cancion) el reloj NUNCA avanza, y reabrir en bucle
+  // dejaba la pantalla clavada en "Cargando buffer..." sin salida posible.
   useEffect(() => {
     if (isAdmin || !voterListening) return;
-    let last = -1, stuck = 0;
+    let last = -1, stuck = 0, reintentos = 0;
     const id = setInterval(() => {
       const a = audioA.current;
       if (!a || document.hidden) return;
       if (a.paused) { a.play().catch(() => {}); return; }
       if (a.currentTime === last) {
-        if (++stuck >= 3) { stuck = 0; last = -1; startListening(); }   // ~9 s atascado
-      } else { stuck = 0; last = a.currentTime; }
+        if (++stuck >= 3) {                       // ~9 s sin avanzar
+          stuck = 0; last = -1;
+          if (reintentos < 2) { reintentos++; startListening(); }
+          else { setVoterStalled(true); setVoterLoading(false); }   // rendirse y avisar
+        }
+      } else { stuck = 0; last = a.currentTime; reintentos = 0; setVoterStalled(false); }
     }, 3000);
     return () => clearInterval(id);
   }, [isAdmin, voterListening]);
@@ -1865,6 +1873,12 @@ export default function UnifiedView() {
                     <div className="flex items-center gap-2 mb-2">
                       <div className="w-3 h-3 border-2 border-red-500 border-t-transparent rounded-full animate-spin flex-shrink-0" />
                       <span className="text-xs text-gray-400 font-medium">Cargando buffer...</span>
+                      {/* El boton de parar NO puede desaparecer mientras carga: si el
+                          servidor no emite, el usuario se quedaba sin forma de salir. */}
+                      <button onClick={stopListening}
+                        className="ml-auto text-[11px] text-gray-500 hover:text-gray-300 underline underline-offset-2">
+                        Cancelar
+                      </button>
                     </div>
                     <div className="h-1.5 bg-gray-800/70 rounded-full overflow-hidden">
                       <div className="h-full rounded-full"
@@ -1904,11 +1918,25 @@ export default function UnifiedView() {
                     <span>Toca aquí para que suene</span>
                   </button>
                 )}
-                {voterNeedsTap && (
+                {voterNeedsTap && !voterStalled && (
                   <p className="text-[11px] text-gray-500 mt-1.5 leading-snug">
                     Si sigue sin oírse, comprueba que el móvil no esté en silencio
                     (interruptor lateral) y sube el volumen multimedia.
                   </p>
+                )}
+                {/* El servidor no esta enviando audio: no es culpa del movil, y
+                    reintentar en bucle solo empeora las cosas. */}
+                {voterStalled && (
+                  <div className="mt-2 rounded-xl border border-yellow-800/50 bg-yellow-950/30 px-3 py-2.5">
+                    <p className="text-xs text-yellow-500 font-semibold">El DJ no esta emitiendo ahora mismo</p>
+                    <p className="text-[11px] text-gray-500 mt-0.5 leading-snug">
+                      No es cosa de tu movil. Volvera solo en cuanto empiece la siguiente cancion.
+                    </p>
+                    <button onClick={() => { setVoterStalled(false); startListening(); }}
+                      className="mt-2 text-[11px] text-yellow-400 hover:text-yellow-300 underline underline-offset-2">
+                      Reintentar ahora
+                    </button>
+                  </div>
                 )}
               </div>
             )}
