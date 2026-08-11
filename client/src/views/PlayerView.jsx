@@ -489,6 +489,7 @@ export default function PlayerView() {
           playingSrcRef.current = newSrc;
           active.volume = targetVolRef.current;
           active.src = newSrc;
+          saltarIntro(active, song);
           // Resumir AudioContext antes de intentar play (puede estar suspendido en background)
           const doPlay = () => active.play()
             .then(() => { setIsPlaying(true); setNeedsTap(false); })
@@ -585,6 +586,7 @@ export default function PlayerView() {
           const src = '/api/stream/' + song.id;
           playingSrcRef.current = src;
           active.src = src;
+          saltarIntro(active, song);
         }
       }
     });

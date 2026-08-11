@@ -335,6 +335,15 @@ function analizarIntro(songId) {
 const introMs  = id => introCache.get(id) || 0;
 const conIntro = s => (s && introMs(s.id)) ? { ...s, introMs: introMs(s.id) } : s;
 
+// Descarta los primeros `ms` de una fuente. Si el sink ya está sincronizado se
+// recorta el buffer en el acto; si todavía no, se deja apuntado para cuando lo
+// esté (una precarga recién abierta aún no tiene ni el primer frame).
+function saltarSilencioInicial(src, ms) {
+  if (!src || !ms) return;
+  if (src.sink.synced && src.sink.out.length) src.sink.out = skipFrames(src.sink.out, ms);
+  else src.skipPendingMs = ms;
+}
+
 // Genera el segmento de mezcla A→B. `startSec` es el punto de A donde arranca.
 // Si A ya viene desvaneciendose sola (`yaBaja`), aplicarle encima un fundido de
 // salida completo la haria desaparecer al doble de velocidad: en ese caso solo se
@@ -567,6 +576,10 @@ function startBroadcast(songId, duration, offsetSec = 0) {
     src = openSource(songId, duration, offsetSec);
   }
   bcastPrefetch = null;
+  // Arrancar donde empieza el sonido. Dentro de una mezcla ya se hacía; aquí se
+  // cubre el resto de arranques (primera canción de la sesión, skip del DJ), que
+  // si no emitían el silencio entero. Al reanudar a mitad (offsetSec) no aplica.
+  if (!offsetSec) saltarSilencioInicial(src, introMs(songId));
 
   // Cerrar la fuente anterior (no la nueva) y adoptar la nueva como emisión.
   // Cerrar la fuente anterior. Ojo: hay que cerrar la vieja, nunca `src` — y no
@@ -657,9 +670,10 @@ function nowPlayingConMezcla() {
   const p = (bcastSource && bcastSource.songId === song.id && bcastSource.mixStartMs)
     ? bcastSource
     : tailCache.get(song.id);
-  if (!p || !p.mixStartMs) return song;
+  const intro = introMs(song.id);
+  if (!p || !p.mixStartMs) return intro ? { ...song, introMs: intro } : song;
   return { ...song, mixStartMs: p.mixStartMs, audioEndMs: p.audioEndMs,
-           fadeMs: p.fadeMs, overlapSec: OVERLAP_SEC };
+           fadeMs: p.fadeMs, overlapSec: OVERLAP_SEC, introMs: intro };
 }
 
 const broadcast = () => {
@@ -924,6 +938,9 @@ app.post('/api/queue/add', auth.authMiddleware, (req, res) => {
     return res.status(429).json({ error: 'Maximo 2 canciones cada 4 minutos. Podras anadir en ' + when });
   }
   if (!db.getSong(song.id)) db.addToQueue(song);
+  // Medir ya si arranca con silencio: cuando le toque sonar el dato estara listo,
+  // venga por una transicion o por un arranque en seco.
+  analizarIntro(song.id);
   if (req.user.role !== 'admin') db.recordAddition(req.user.id);
   broadcast();
   res.json({ success: true });

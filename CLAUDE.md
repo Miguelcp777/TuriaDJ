@@ -350,11 +350,25 @@ la DB pero ya no lo lee nadie.
 
 #### Silencio con el que ARRANCA la entrante
 
-Medido: **7 de cada 20 canciones empiezan con silencio, la peor con 7,9 s**. Sin recortarlo el
-solape cae sobre la nada. `analizarIntro` lo mide con `silencedetect` cuando se precarga la
-siguiente (~90 s antes) y viaja al cliente como `introMs` en la cola, en `/api/player/next` y
-en `player:peek-next`. A/B sobre "Fantasy Girl": el solape terminaba en **−93,5 dB** (silencio
-digital) y ahora termina en −31 dB.
+Censo sobre 120 canciones: **44 % empiezan con algo de silencio, 13 % con 1 s o más, 7 % con
+2 s o más; la peor ("Fantasy Girl") 7,9 s**. `analizarIntro` lo mide con `silencedetect` al
+añadir la canción a la cola y al precargarla, y viaja al cliente como `introMs` en la cola,
+en `now-playing`, en `/api/player/next` y en `player:peek-next`.
+
+Se recorta en **todos** los arranques, no solo en las transiciones:
+
+| Camino | Dónde se aplica |
+|---|---|
+| Mezcla del servidor (voters) | `renderBridge` abre B en `introMs`; `enterBridge` suma ese salto |
+| Arranque en seco (voters) | `startBroadcast` → `saltarSilencioInicial` (usa `skipFrames`/`skipPendingMs`) |
+| Panel admin | `startCrossfade` y `loadAndPlay` ponen `currentTime` |
+| PlayerView | `saltarIntro` en preload, crossfade, switch inmediato y `player:update` |
+
+⚠️ **No aplicar cuando se reanuda a mitad de canción** (`offsetSec`): ya se está por delante.
+
+A/B medidos sobre "Fantasy Girl": el solape de una transición terminaba en **−93,5 dB**
+(silencio digital) y ahora en −31 dB; un arranque en seco emitía **17 ventanas mudas de 0,5 s**
+(8,5 s de nada) y ahora **0**.
 
 ### Cuándo se dispara
 
@@ -470,6 +484,7 @@ También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-08-11 | **Silencio inicial recortado en TODO arranque** — el recorte solo se aplicaba dentro de una transición, así que la primera canción de la sesión, un skip del DJ o una recarga del panel emitían el silencio entero. Censo: **44% de la biblioteca empieza con algo de silencio, 13% con 1 s o más**. A/B sobre "Fantasy Girl" arrancando en seco: **17 ventanas mudas de 0,5 s → 0**. |
 | 2026-08-11 | **Regla de mezcla única: solapar 3 s, sin mandos** — se quitan los dos sliders de silencio (y el de duración del crossfade, que la contradecía). El servidor calcula por canción dónde entra la siguiente según su final (seco / silencio de cola / fundido) y lo manda como `mixStartMs`; sala, `/player` y móviles usan el mismo punto. ⚠️ Dos hallazgos: `astats` imprime **por frame**, no por ventana (había que agrupar con `asetnsamples`), y **7 de cada 20 canciones empiezan con silencio** (la peor 7,9 s) — sin recortarlo el solape terminaba en −93,5 dB. Verificado sobre **60 canciones** de la biblioteca real (17 secas, 16 con cola muda, 27 con fundido): el solape cae siempre sobre música. |
 | 2026-08-09 | **Acceso con cuenta de Google** — botón junto al formulario de siempre, que sigue funcionando. Flujo de *ID token*: el servidor verifica el JWT con `google-auth-library` (firma, emisor y audiencia); **no hay client secret que custodiar**. Se exige `email_verified`. Alta automática al primer acceso, vinculando por email si la cuenta ya existía. ⚠️ `password_hash` es NOT NULL y SQLite no deja quitarlo sin reconstruir la tabla: las cuentas de Google guardan un centinela `google:<aleatorio>` y el login por contraseña **rechaza explícitamente** lo que no empiece por `$2`. Todo inactivo si falta `GOOGLE_CLIENT_ID`. |
 | 2026-08-09 | **`bcrypt` nativo** — 60 logins simultáneos dejaban ~4,75 s sin audio a todos los oyentes (bcrypt bloquea el hilo que emite). ⚠️ Pasar de `compareSync` a `compare` NO arregla nada: `bcryptjs` es JS puro y su API asíncrona solo trocea el trabajo en el mismo hilo. El fix es `bcrypt` nativo, que usa el threadpool de libuv. Retraso máximo del emisor: 5347 ms → **2 ms**. `bcryptjs` queda como respaldo; los hashes son compatibles en ambos sentidos. |

@@ -1234,6 +1234,15 @@ export default function UnifiedView() {
     if (!audioA.current || !song) return;
     audioA.current.src = '/api/stream/' + song.id;
     audioA.current.load();
+    // Arrancar donde empieza el sonido: el 44% de la biblioteca abre con algo de
+    // silencio y el peor caso son casi 8 s. En una transición ya se saltaba; esto
+    // cubre el arranque en seco (primera canción, skip, recarga del panel).
+    const intro = (song.introMs || 0) / 1000;
+    if (intro > 0.3) {
+      const poner = () => { try { audioA.current.currentTime = intro; } catch (e) {} };
+      if (audioA.current.readyState >= 1) poner();
+      else audioA.current.addEventListener('loadedmetadata', poner, { once: true });
+    }
     audioA.current.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
   };
 
