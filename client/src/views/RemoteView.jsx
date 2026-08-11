@@ -68,9 +68,7 @@ export default function RemoteView() {
   const [isPlaying, setIsPlaying]     = useState(false);
   const [progress, setProgress]       = useState({ position: 0, duration: 0 });
   const [volume, setVolume]           = useState(100);
-  const [silenceThreshold, setSilenceThreshold] = useState(0.02);
-  const [silenceSeconds, setSilenceSeconds]     = useState(1);
-  const [crossfadeSecs, setCrossfadeSecs]       = useState(4);
+  const [overlapSecs, setOverlapSecs]           = useState(3);
   const [showSilence, setShowSilence]           = useState(false);
   const skipBusy = useRef(false);
 
@@ -94,12 +92,8 @@ export default function RemoteView() {
     socket.on('queue:update',   setQueue);
     socket.on('player:progress', p => setProgress(p || { position: 0, duration: 0 }));
     socket.on('player:state',   ({ playing }) => setIsPlaying(playing));
-    socket.on('player:silence-config', ({ threshold, seconds }) => {
-      if (threshold !== undefined) setSilenceThreshold(threshold);
-      if (seconds   !== undefined) setSilenceSeconds(seconds);
-    });
-    socket.on('player:crossfade-config', ({ ms }) => {
-      if (ms && ms > 0) setCrossfadeSecs(ms / 1000);
+    socket.on('player:silence-config', ({ overlapSec }) => {
+      if (overlapSec > 0) setOverlapSecs(overlapSec);
     });
     fetch('/api/now-playing').then(r => r.json()).then(s => { if (s) setNowPlaying(s); });
     fetch('/api/queue').then(r => r.json()).then(setQueue);
@@ -139,24 +133,6 @@ export default function RemoteView() {
   const handleVolume = v => {
     setVolume(v);
     cmd('volume', v / 100);
-  };
-
-  const handleSilenceThreshold = v => {
-    setSilenceThreshold(v);
-    cmd('silence-threshold', v);
-  };
-
-  const handleSilenceSeconds = v => {
-    setSilenceSeconds(v);
-    cmd('silence-seconds', v);
-  };
-
-  const handleCrossfadeSecs = v => {
-    setCrossfadeSecs(v);
-    authFetch('/api/player/crossfade-config', {
-      method: 'POST',
-      body: JSON.stringify({ ms: v * 1000 }),
-    }).catch(() => {});
   };
 
   const handleAuth = (token, u) => { setAuthToken(token); setUser(u); };
@@ -247,66 +223,29 @@ export default function RemoteView() {
         </div>
       </div>
 
-      {/* Crossfade + Silence config */}
+      {/* Mezcla entre canciones — sin mandos: la regla es fija (ver server.js,
+          puntosDeMezcla). Se deja el desplegable solo para poder consultarla. */}
       <div className="mb-6">
         <button
           onClick={() => setShowSilence(v => !v)}
           className="flex items-center gap-2 text-gray-500 hover:text-gray-300 transition-colors w-full"
         >
           <SlidersHorizontal size={14} />
-          <span className="text-xs font-semibold uppercase tracking-widest">Crossfade y silencio</span>
+          <span className="text-xs font-semibold uppercase tracking-widest">Mezcla entre canciones</span>
           {showSilence ? <ChevronUp size={14} className="ml-auto" /> : <ChevronDown size={14} className="ml-auto" />}
         </button>
 
         {showSilence && (
-          <div className="mt-3 space-y-4 bg-gray-900/50 rounded-xl p-4 border border-gray-800/40">
-            <div>
-              <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Duración del crossfade</span>
-                <span className="text-gray-300 font-mono">{crossfadeSecs.toFixed(0)} s</span>
-              </div>
-              <input
-                type="range" min={1} max={10} step={1}
-                value={crossfadeSecs}
-                onChange={e => handleCrossfadeSecs(Number(e.target.value))}
-                className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer"
-              />
-              <div className="flex justify-between text-xs text-gray-700 mt-1">
-                <span>corto</span><span>largo</span>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Umbral de silencio</span>
-                <span className="text-gray-300 font-mono">{silenceThreshold.toFixed(3)}</span>
-              </div>
-              <input
-                type="range" min={0.005} max={0.08} step={0.005}
-                value={silenceThreshold}
-                onChange={e => handleSilenceThreshold(Number(e.target.value))}
-                className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer"
-              />
-              <div className="flex justify-between text-xs text-gray-700 mt-1">
-                <span>sensible</span><span>tolerante</span>
-              </div>
-            </div>
-
-            <div>
-              <div className="flex justify-between text-xs text-gray-500 mb-2">
-                <span>Segundos antes de avance por silencio</span>
-                <span className="text-gray-300 font-mono">{silenceSeconds.toFixed(1)} s</span>
-              </div>
-              <input
-                type="range" min={0.5} max={5} step={0.5}
-                value={silenceSeconds}
-                onChange={e => handleSilenceSeconds(Number(e.target.value))}
-                className="w-full accent-red-600 h-1.5 rounded-full cursor-pointer"
-              />
-              <div className="flex justify-between text-xs text-gray-700 mt-1">
-                <span>rápido</span><span>conservador</span>
-              </div>
-            </div>
+          <div className="mt-3 bg-gray-900/50 rounded-xl p-4 border border-gray-800/40 space-y-2">
+            <p className="text-xs text-gray-400">
+              Las canciones se solapan <span className="text-gray-200 font-mono">{overlapSecs} s</span>. Automático,
+              no hay nada que ajustar.
+            </p>
+            <ul className="text-[11px] text-gray-600 leading-relaxed list-disc pl-4">
+              <li>Final seco: solape sobre los últimos {overlapSecs} s.</li>
+              <li>Silencio de cola: solape sobre los últimos {overlapSecs} s con música.</li>
+              <li>Fundido: la siguiente entra 2 s después de empezar el fundido.</li>
+            </ul>
           </div>
         )}
       </div>

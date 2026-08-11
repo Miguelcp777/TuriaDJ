@@ -59,6 +59,15 @@ export default function PlayerView() {
   // PV-003: umbrales configurables desde RemoteView vía player:cmd
   const silenceThresholdRef = useRef(SILENCE_THRESHOLD);
   const silenceSecondsRef   = useRef(SILENCE_SECONDS);
+  // Segundo de la canción en el que debe entrar la siguiente. Lo calcula el
+  // servidor mirando cómo acaba (final seco, silencio de cola o fundido) y llega
+  // con la canción. Mientras no llegue vale null y se usa el margen de siempre.
+  const mixStartRef = useRef(null);
+
+  useEffect(() => {
+    mixStartRef.current = nowPlaying?.mixStartMs ? nowPlaying.mixStartMs / 1000 : null;
+    if (nowPlaying?.overlapSec > 0) crossfadeMsRef.current = nowPlaying.overlapSec * 1000;
+  }, [nowPlaying]);
 
   const getActive   = () => activeRef.current === 'A' ? audioA.current : audioB.current;
   const getInactive = () => activeRef.current === 'A' ? audioB.current : audioA.current;
@@ -141,6 +150,17 @@ export default function PlayerView() {
     }, 200);
   };
 
+  // Muchas canciones empiezan con silencio (medido sobre la biblioteca: 7 de cada
+  // 20, y la peor con 7,9 s). Si la entrante arranca en su segundo 0, el solape
+  // cae sobre la nada. El servidor mide ese silencio y lo manda en `introMs`.
+  const saltarIntro = (el, song) => {
+    const intro = ((song && song.introMs) || 0) / 1000;
+    if (!el || intro <= 0.3) return;
+    const poner = () => { try { el.currentTime = intro; } catch (e) {} };
+    if (el.readyState >= 1) poner();
+    else el.addEventListener('loadedmetadata', poner, { once: true });
+  };
+
   // ── PV-002: precarga de la siguiente canción ─────────────────────────────
   // Carga el audio de `song` en el elemento INACTIVO y lo marca como precargado.
   const doPreload = (song) => {
@@ -150,6 +170,7 @@ export default function PlayerView() {
     inactive.src     = '/api/stream/' + song.id;
     inactive.preload = 'auto';
     inactive.load();
+    saltarIntro(inactive, song);
     preloadedRef.current = song.id;
   };
 
@@ -197,6 +218,7 @@ export default function PlayerView() {
     if (preloadedRef.current !== song.id) {
       next.src = newSrc;
       next.load();
+      saltarIntro(next, song);
     }
     preloadedRef.current = '';
     next.volume = 0;
@@ -300,6 +322,7 @@ export default function PlayerView() {
     playingSrcRef.current = src;
     active.volume = targetVolRef.current;
     active.src = src;
+    saltarIntro(active, song);
     updateMediaSession(song);   // PV-001
     setNowPlaying(song);
     setIsPlaying(false);
@@ -479,9 +502,10 @@ export default function PlayerView() {
       }
     });
 
-    socket.on('player:silence-config', ({ threshold, seconds }) => {
+    socket.on('player:silence-config', ({ threshold, seconds, overlapSec }) => {
       if (threshold !== undefined) silenceThresholdRef.current = threshold;
       if (seconds   !== undefined) silenceSecondsRef.current   = seconds;
+      if (overlapSec > 0)          crossfadeMsRef.current      = overlapSec * 1000;
     });
 
     socket.on('player:crossfade-config', ({ ms }) => {
@@ -610,13 +634,15 @@ export default function PlayerView() {
         if (audioCtxRef.current?.state === 'suspended') audioCtxRef.current.resume().catch(() => {});
         startSilenceMonitor();
       }
-      // Crossfade anticipado: disparar (crossfadeMs/1000 + 1)s antes del final.
-      // Garantiza solapamiento real (ambas canciones suenan juntas) durante el
-      // periodo configurado, en lugar de fade-in desde silencio post-canción.
+      // Entrada de la siguiente canción. El servidor da el segundo exacto según
+      // cómo acabe ésta; si aún no ha llegado ese dato, se usa el margen de
+      // siempre (la duración del solape más un segundo antes del final).
+      const entrada    = mixStartRef.current;
       const preTrigger = Math.ceil(crossfadeMsRef.current / 1000) + 1;
-      if (remaining <= preTrigger && remaining > 0 && !advancingRef.current && !crossfadeTimer.current) {
-        clog('pretrigger', { rem: parseFloat(remaining.toFixed(1)), pt: preTrigger });
-        console.log(`[crossfade] pre-trigger at ${remaining.toFixed(2)}s remaining (preTrigger=${preTrigger}s)`);
+      const dispara    = entrada != null ? pos >= entrada : remaining <= preTrigger;
+      if (dispara && remaining > 0 && !advancingRef.current && !crossfadeTimer.current) {
+        clog('pretrigger', { rem: parseFloat(remaining.toFixed(1)), entra: entrada ? parseFloat(entrada.toFixed(1)) : null });
+        console.log(`[crossfade] entra la siguiente en ${pos.toFixed(1)}s (previsto ${entrada != null ? entrada.toFixed(1) : 'sin dato'})`);
         handleEnded(false);
       }
     }

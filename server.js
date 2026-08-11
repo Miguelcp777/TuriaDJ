@@ -247,46 +247,30 @@ function sinkFeed(sink, chunk) {
 // El crossfade de cliente (dual <audio>) solo lo tienen el admin y PlayerView.
 // Los voters recibian un corte seco, y si la cancion traia silencio de cola se
 // oia ese silencio entero. Aqui se resuelve en dos pasos:
-//   1. detectAudioEnd: localiza donde acaba el audio DE VERDAD (sin el silencio
-//      final), para no cruzar silencio con silencio.
+//   1. analizarFinal: localiza el punto donde debe entrar la siguiente, mirando
+//      como acaba esta (final seco, silencio de cola o fundido).
 //   2. renderBridge: ffmpeg mezcla la cola de A con la cabeza de B y devuelve un
 //      MP3 que se emite en medio. Se genera con antelacion (peek-next avisa ~90 s
 //      antes), asi que el arranque de ffmpeg no se nota.
 // Todo degrada con seguridad: si algo falla se hace el corte limpio de siempre.
 const BRIDGE_MAX_BYTES = 6 * 1024 * 1024;
 
-// Localiza donde acaba la musica AUDIBLE. `silencedetect` NO sirve: exige que el
-// nivel siga bajo el umbral de forma continua, asi que un desvanecimiento con
-// golpes sueltos lo resetea y da el final en el ultimo suspiro. Medido sobre
-// "Chulo": situaba el final donde la cancion ya sonaba a -31 dB, 22 dB por debajo
-// de su media -> el solapamiento habria sido inaudible. Aqui se toma el RMS en
-// ventanas de ~1 s y se busca la ultima que supere (media - TAIL_DROP_DB). Con
-// eso "Chulo" recorta 7,6 s de fade y entra en la mezcla a -9,1 dB (nivel pleno).
-const TAIL_SCAN_SEC = 100;                 // solo se analiza el final de la cancion
-const audioEndCache = new Map();           // songId -> endMs (las canciones se repiten)
+// La regla que decide donde entra la siguiente cancion vive en mezcla.js, aparte,
+// para poder medirla contra la biblioteca real sin arrancar el servidor.
+const { puntosDeMezcla, OVERLAP_SEC, TAIL_SCAN_SEC, FILTRO_RMS } = require('./mezcla');
+const tailCache = new Map();   // songId -> {audioEndMs, mixStartMs, fadeMs}
 
-// Los dos mandos del panel admin. `dropDb`: cuantos dB por debajo del nivel de la
-// propia cancion se deja de considerar musica (subirlo recorta mas fade, bajarlo
-// es mas conservador). `maxCut`: tope de seguridad en segundos.
-function silenceConfig() {
-  return {
-    dropDb: parseFloat(db.getSetting('silence_drop_db') || 12),
-    maxCut: parseFloat(db.getSetting('silence_max_cut') || 20),
-  };
-}
-
-function detectAudioEnd(src, songId, durationSec) {
+function analizarFinal(src, songId, durationSec) {
   if (!durationSec || durationSec < 20) return;
-  const cached = audioEndCache.get(songId);
-  if (cached !== undefined) { src.audioEndMs = cached; maybeRenderBridge(); return; }
+  const cached = tailCache.get(songId);
+  if (cached) { Object.assign(src, cached); maybeRenderBridge(); return; }
 
   // Analizar la cancion ENTERA costaba 6,6 s de descarga y decodificacion por cada
   // tema, compitiendo con el hilo que emite el audio. Solo interesa el final, asi
-  // que se salta directamente ahi. La referencia de "nivel pleno" se toma del
-  // percentil 75 de ese tramo en vez de la media global.
+  // que se salta directamente ahi.
   const from = Math.max(0, durationSec - TAIL_SCAN_SEC);
   const ff = spawn('ffmpeg', ['-hide_banner','-nostats','-ss', String(from), '-i', nd.streamUrl(songId),
-    '-af','astats=metadata=1:reset=45,ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-',
+    '-af', FILTRO_RMS,
     '-f','null','-']);
   let out = '';
   ff.stdout.on('data', d => { out += d.toString(); if (out.length > 4e6) { try { ff.kill('SIGKILL'); } catch(e) {} } });
@@ -297,48 +281,75 @@ function detectAudioEnd(src, songId, durationSec) {
     const v = [...out.matchAll(/RMS_level=(-?[\d.]+|-inf)/g)]
       .map(m => m[1] === '-inf' ? -99 : parseFloat(m[1]))
       .filter(x => !isNaN(x));
-    let endMs = durationSec * 1000;
-    if (v.length >= 10) {
-      // Referencia de "nivel pleno": percentil 75 del tramo analizado. Con la media
-      // no valdria, porque si el tramo es mayoritariamente fade la media ya es baja.
-      const ord = [...v].sort((a, b) => a - b);
-      const refDb = ord[Math.floor(ord.length * 0.75)];
-      const cfg = silenceConfig();
-      const th  = refDb - cfg.dropDb;                   // mando del panel admin
-      const win = (durationSec - from) / v.length;      // el tramo empieza en `from`
-      let last = v.length - 1;
-      while (last > 0 && v[last] < th) last--;
-      endMs = Math.min(durationSec, from + (last + 1) * win) * 1000;
-      // Topes de seguridad: nunca recortar mas de lo configurado ni mas del 20%
-      // de la cancion (hay outros largos y tranquilos que siguen siendo musica).
-      const maxCut = Math.min(cfg.maxCut * 1000, durationSec * 1000 * 0.2);
-      if (durationSec * 1000 - endMs > maxCut) endMs = durationSec * 1000 - maxCut;
-    }
-    src.audioEndMs = endMs;
-    audioEndCache.set(songId, endMs);
-    if (audioEndCache.size > 400) audioEndCache.delete(audioEndCache.keys().next().value);
-    if (endMs < durationSec * 1000 - 200)
-      slog('broadcast:tailCut', { id: songId.slice(0, 8), cut: +((durationSec - endMs / 1000).toFixed(1)) });
+    const p = puntosDeMezcla(v, from, durationSec);
+    Object.assign(src, p);
+    tailCache.set(songId, p);
+    if (tailCache.size > 400) tailCache.delete(tailCache.keys().next().value);
+    slog('broadcast:mezcla', { id: songId.slice(0, 8),
+      entra:   +(p.mixStartMs / 1000).toFixed(1),
+      dura:    +durationSec.toFixed(1),
+      fundido: +(p.fadeMs / 1000).toFixed(1) });
     // El analisis tarda unos segundos: cuando acaba hay que reenviar la cancion
-    // para que el reproductor de la sala conozca ya el final real y adelante ahi
-    // su crossfade. Sin esto solo se enteraria a partir del tema siguiente.
+    // para que el reproductor de la sala sepa ya donde entra la siguiente. Sin
+    // esto solo se enteraria a partir del tema siguiente.
     const actual = db.getNowPlaying();
-    if (actual && actual.id === songId) io.emit('player:update', nowPlayingConAudioEnd());
+    if (actual && actual.id === songId) io.emit('player:update', nowPlayingConMezcla());
     maybeRenderBridge();
   });
   setTimeout(() => { try { ff.kill('SIGKILL'); } catch(e) {} }, 60000);
 }
 
 
+// ── Silencio con el que ARRANCA la cancion entrante ──────────────────────────
+// Medido sobre la biblioteca: 7 de cada 20 canciones empiezan con silencio y la
+// peor traia 7,9 s. Si no se recorta, el solape de 3 s cae sobre la nada: la
+// saliente se apaga y la entrante todavia no ha empezado. Es el mismo silencio
+// que se quiere evitar, solo que por el otro lado.
+const INTRO_MAX_SEC = 8;              // tope: no comerse una intro de verdad
+const introCache    = new Map();      // songId -> ms de silencio inicial
+
+function analizarIntro(songId) {
+  if (!songId || introCache.has(songId)) return;
+  introCache.set(songId, 0);          // provisional: no lanzar dos analisis a la vez
+  const ff = spawn('ffmpeg', ['-hide_banner', '-nostats', '-t', String(INTRO_MAX_SEC + 2),
+    '-i', nd.streamUrl(songId), '-af', 'silencedetect=n=-50dB:d=0.2', '-f', 'null', '-']);
+  let err = '';
+  ff.stderr.on('data', d => { if (err.length < 65536) err += d.toString(); });
+  ff.on('error', () => {});
+  ff.on('close', () => {
+    const m = err.match(/silence_start:\s*(-?[\d.]+)[\s\S]*?silence_end:\s*([\d.]+)/);
+    let ms = (m && parseFloat(m[1]) < 0.3) ? Math.min(INTRO_MAX_SEC, parseFloat(m[2])) * 1000 : 0;
+    if (ms < 300) ms = 0;             // por debajo de 0,3 s no se nota
+    introCache.set(songId, ms);
+    if (introCache.size > 400) introCache.delete(introCache.keys().next().value);
+    if (ms) {
+      slog('broadcast:intro', { id: songId.slice(0, 8), corta: +(ms / 1000).toFixed(1) });
+      // Una mezcla ya renderizada arrancaria B en su segundo 0, con el silencio
+      // dentro. Se tira y se rehace con el arranque bueno.
+      if (bcastBridge && bcastBridge.songB === songId) { bcastBridge = null; maybeRenderBridge(); }
+      broadcast();                    // que el cliente se entere del recorte
+    }
+  });
+  setTimeout(() => { try { ff.kill('SIGKILL'); } catch (e) {} }, 30000);
+}
+const introMs  = id => introCache.get(id) || 0;
+const conIntro = s => (s && introMs(s.id)) ? { ...s, introMs: introMs(s.id) } : s;
+
 // Genera el segmento de mezcla A→B. `startSec` es el punto de A donde arranca.
-function renderBridge(songA, startSec, songB, secs, srate, ch) {
+// Si A ya viene desvaneciendose sola (`yaBaja`), aplicarle encima un fundido de
+// salida completo la haria desaparecer al doble de velocidad: en ese caso solo se
+// le pone el ultimo segundo, lo justo para que el corte final no suene a click.
+function renderBridge(songA, startSec, songB, secs, srate, ch, yaBaja) {
   const gen = bcastGen;
-  const bridge = { ready: false, buf: Buffer.alloc(0), gen, songB, secs };
-  const f = `[0:a]afade=t=out:st=0:d=${secs}[a];[1:a]afade=t=in:st=0:d=${secs}[b];` +
+  const introB = introMs(songB) / 1000;    // arrancar B donde empieza su sonido
+  const bridge = { ready: false, buf: Buffer.alloc(0), gen, songB, secs, introMs: introB * 1000 };
+  const fadeA = yaBaja ? `afade=t=out:st=${Math.max(0, secs - 1)}:d=1`
+                       : `afade=t=out:st=0:d=${secs}`;
+  const f = `[0:a]${fadeA}[a];[1:a]afade=t=in:st=0:d=${secs}[b];` +
             `[a][b]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[out]`;
   const ff = spawn('ffmpeg', ['-v','error',
     '-ss', String(startSec), '-t', String(secs), '-i', nd.streamUrl(songA),
-    '-t', String(secs), '-i', nd.streamUrl(songB),
+    '-ss', String(introB), '-t', String(secs), '-i', nd.streamUrl(songB),
     '-filter_complex', f,
     // -map explicito + -vn: las canciones llevan la caratula incrustada y ffmpeg
     // la mapea sola como stream de video. Con el ID3v2 desactivado en la salida
@@ -383,7 +394,9 @@ function enterBridge() {
   }
   slog('broadcast:crossfade', { secs: b.secs, kb: Math.round(b.buf.length/1024) });
   const prev = bcastSource;
-  bcastAfterBridge = { src: bcastPrefetch, skipMs: b.secs * 1000 };
+  // Lo que ya ha sonado de B dentro de la mezcla, mas el silencio inicial que la
+  // mezcla se ha saltado: al soltar B hay que empezar justo donde lo dejo.
+  bcastAfterBridge = { src: bcastPrefetch, skipMs: b.secs * 1000 + (b.introMs || 0) };
   // Desde ya la emisión "es" la canción siguiente: si el cliente pide el avance
   // mientras suena la mezcla, el guard de startBroadcast lo ignora en vez de
   // reiniciar la canción y cortar el crossfade a la mitad.
@@ -415,7 +428,7 @@ function finishBridge() {
   src.clockStart = Date.now();
   bcastBPS       = src.bps;
   slog('broadcast:bridgeDone', { id: String(src.songId).slice(0,8) });
-  if (src.songId) detectAudioEnd(src, src.songId, src.durationSec || 0);
+  if (src.songId) analizarFinal(src, src.songId, src.durationSec || 0);
 }
 
 // Interruptor del crossfade de servidor. Por DEFECTO DESACTIVADO: la ruta que
@@ -427,22 +440,17 @@ function serverCrossfadeEnabled() {
   return db.getSetting('crossfade_server') === '1';
 }
 
-// Lanza el render en cuanto se conocen las dos canciones y el final real de A.
+// Lanza el render en cuanto se conocen las dos canciones y el punto de mezcla de A.
 function maybeRenderBridge() {
   if (!serverCrossfadeEnabled()) return;
   const cur = bcastSource, nxt = bcastPrefetch;
   if (!cur || !nxt || bcastBridge || !cur.songId || !nxt.songId) return;
-  if (!cur.audioEndMs || !cur.sink.srate) return;
-  // Suelo de 3 s: el solapamiento debe ser audible. El slider de la UI llega a
-  // bajar a 1 s, que para una mezcla en el servidor se queda en nada.
-  const secs = Math.max(3, Math.min(10, parseInt(db.getSetting('crossfade_ms') || 4000, 10) / 1000));
-  // audioEndMs es donde acaba la MUSICA, no el fichero: si la cancion trae 4 s
-  // de silencio final, la mezcla arranca 4+secs segundos antes del final real.
-  const startSec = cur.audioEndMs / 1000 - secs;
+  if (!cur.mixStartMs || !cur.sink.srate) return;
+  const startSec = cur.mixStartMs / 1000;
   if (startSec <= 1) return;
-  bcastBridge = renderBridge(cur.songId, startSec, nxt.songId, secs,
-                             cur.sink.srate, cur.sink.ch || 2);
-  bcastBridge.startMs = startSec * 1000;
+  bcastBridge = renderBridge(cur.songId, startSec, nxt.songId, OVERLAP_SEC,
+                             cur.sink.srate, cur.sink.ch || 2, cur.fadeMs > 0);
+  bcastBridge.startMs = cur.mixStartMs;
 }
 
 // Abre el stream de una canción en Navidrome y va llenando un sink (que descarta
@@ -519,6 +527,7 @@ function prefetchBroadcast(songId, duration) {
   if (bcastPrefetch) { bcastPrefetch.cancelled = true;
                        try { bcastPrefetch.upstream?.destroy(); } catch(e) {} }
   slog('broadcast:prefetch', { id: songId.slice(0, 8) });
+  analizarIntro(songId);         // saber si arranca con silencio, para recortarlo
   bcastPrefetch = openSource(songId, duration);
   bcastBridge   = null;          // la mezcla vieja apuntaba a otra canción
   maybeRenderBridge();
@@ -578,7 +587,7 @@ function startBroadcast(songId, duration, offsetSec = 0) {
   bcastBridge = null; bcastAfterBridge = null;
   // Localizar dónde acaba el audio útil (sin el silencio de cola) con tiempo de
   // sobra: el resultado se usa varios minutos después, al preparar el crossfade.
-  detectAudioEnd(src, songId, duration);
+  analizarFinal(src, songId, duration);
   // El ticker NO se para en los cambios de canción: si se parase, los oyentes
   // dejarían de recibir bytes hasta que Navidrome respondiese.
   if (!bcastTicker) bcastTicker = setInterval(bcastTick, TICK_MS);
@@ -637,23 +646,25 @@ function syncNextUp() {
   if (!bcastPrefetch && bcastSongId !== esperado) prefetchBroadcast(esperado, nextUpDuration());
 }
 
-// La canción que se manda al cliente lleva `audioEndMs`: el punto donde acaba la
-// MUSICA segun el detector del servidor. El reproductor de la sala lo usa para
-// arrancar el crossfade ahi en vez de al final del fichero, asi que deja de sonar
-// el silencio de cola. Es el mismo criterio que se aplica a los oyentes de
-// /api/live, de modo que sala y moviles se comportan igual.
-function nowPlayingConAudioEnd() {
+// La canción que se manda al cliente lleva `mixStartMs`: el instante EXACTO en el
+// que debe entrar la siguiente, ya calculado segun como acabe esta (seco, con
+// silencio de cola o con fundido). El reproductor de la sala solo tiene que
+// arrancar ahi su crossfade de 3 s. Es el mismo punto que usa la mezcla del
+// servidor para los oyentes de /api/live, asi que sala y moviles cortan igual.
+function nowPlayingConMezcla() {
   const song = db.getNowPlaying();
   if (!song) return null;
-  const fin = (bcastSource && bcastSource.songId === song.id && bcastSource.audioEndMs)
-    ? bcastSource.audioEndMs
-    : audioEndCache.get(song.id);
-  return fin ? { ...song, audioEndMs: fin } : song;
+  const p = (bcastSource && bcastSource.songId === song.id && bcastSource.mixStartMs)
+    ? bcastSource
+    : tailCache.get(song.id);
+  if (!p || !p.mixStartMs) return song;
+  return { ...song, mixStartMs: p.mixStartMs, audioEndMs: p.audioEndMs,
+           fadeMs: p.fadeMs, overlapSec: OVERLAP_SEC };
 }
 
 const broadcast = () => {
-  io.emit('queue:update',  db.getQueue());
-  io.emit('player:update', nowPlayingConAudioEnd());
+  io.emit('queue:update',  db.getQueue().map(conIntro));
+  io.emit('player:update', nowPlayingConMezcla());
   try { syncNextUp(); } catch (e) { console.error('syncNextUp error:', e.message); }
 };
 
@@ -894,7 +905,7 @@ app.get('/api/browse', auth.authMiddleware, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.get('/api/queue', auth.authMiddleware, (req, res) => res.json(db.getQueue()));
+app.get('/api/queue', auth.authMiddleware, (req, res) => res.json(db.getQueue().map(conIntro)));
 
 app.get('/api/queue/my-votes', auth.authMiddleware, (req, res) => {
   res.json(db.getUserVotes(req.user.id));
@@ -949,28 +960,20 @@ app.delete('/api/queue', auth.adminMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
-// Config del recorte de cola. Antes gobernaba un detector por RMS que corria en
-// el navegador y, medido sobre la biblioteca real, apenas adelantaba 0,2-1,4 s:
-// el pre-trigger del crossfade se le adelantaba en 7 de 8 canciones, y en el
-// panel admin ni siquiera existia ese detector. Ahora estos dos mandos controlan
-// el detector del servidor (detectAudioEnd), que mide en ventanas de RMS con un
-// umbral RELATIVO al nivel de cada cancion y recorta 2-8 s.
+// El recorte de cola ya no se configura: hubo dos mandos (umbral en dB y recorte
+// maximo) y no habia forma de acertar con un solo par de valores para toda la
+// biblioteca. Ahora la regla es fija —solapar 3 s— y lo unico que se calcula por
+// cancion es DONDE empieza ese solapamiento (ver puntosDeMezcla). El endpoint se
+// mantiene para que un cliente con JS viejo en cache no reciba un 404, y para
+// poder forzar un recalculo de la cancion en curso.
 app.post('/api/player/silence-config', auth.adminMiddleware, (req, res) => {
-  const { dropDb, maxCut } = req.body || {};
-  if (dropDb !== undefined) db.setSetting('silence_drop_db', Math.max(4, Math.min(30, parseFloat(dropDb) || 12)));
-  if (maxCut !== undefined) db.setSetting('silence_max_cut', Math.max(0, Math.min(30, parseFloat(maxCut) || 20)));
-  const data = silenceConfig();
-  // La cache guarda finales calculados con el umbral ANTERIOR: hay que tirarla y
-  // recalcular la cancion en curso, o el cambio no se notaria hasta la siguiente.
-  audioEndCache.clear();
+  tailCache.clear();
   bcastBridge = null;
   if (bcastSource && bcastSource.songId && !bcastSource.isBridge) {
-    bcastSource.audioEndMs = null;
-    detectAudioEnd(bcastSource, bcastSource.songId, bcastSource.durationSec || 0);
+    bcastSource.mixStartMs = null;
+    analizarFinal(bcastSource, bcastSource.songId, bcastSource.durationSec || 0);
   }
-  slog('silence:config', data);
-  io.emit('player:silence-config', data);
-  res.json({ success: true, ...data });
+  res.json({ success: true, overlapSec: OVERLAP_SEC });
 });
 
 app.post('/api/player/crossfade-config', auth.adminMiddleware, (req, res) => {
@@ -981,7 +984,7 @@ app.post('/api/player/crossfade-config', auth.adminMiddleware, (req, res) => {
   res.json({ success: true, ms: crossfadeMs });
 });
 
-app.get('/api/now-playing', (req, res) => { const song = nowPlayingConAudioEnd(); res.json(song ? { ...song, position: lastProgress.position } : null); });
+app.get('/api/now-playing', (req, res) => { const song = nowPlayingConMezcla(); res.json(song ? { ...song, position: lastProgress.position } : null); });
 
 // ── advanceQueue: lógica de avance compartida entre HTTP y socket ─────────────
 // Protección contra doble avance:
@@ -1102,7 +1105,7 @@ async function advanceQueue({ auto = false } = {}) {
 app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
   try {
     const song = await advanceQueue();
-    res.json({ song });
+    res.json({ song: conIntro(song) });
   } catch (e) {
     console.error('player/next error:', e.message);
     res.status(500).json({ error: 'Error interno del servidor' });
@@ -1365,8 +1368,8 @@ function slog(event, data = {}) {
 
 
 io.on('connection', socket => {
-  socket.emit('queue:update',   db.getQueue());
-  socket.emit('player:update',  nowPlayingConAudioEnd());
+  socket.emit('queue:update',   db.getQueue().map(conIntro));
+  socket.emit('player:update',  nowPlayingConMezcla());
   socket.emit('session:update', { active: db.getSessionActive(), name: db.getSessionName(), desc: db.getSessionDesc() });
   socket.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: autoDJActive });
   const storedEnd = db.getSetting('session_end_time');
@@ -1438,12 +1441,12 @@ io.on('connection', socket => {
       if (queue.length) {
         // Aprovechar el aviso para precargar también el broadcast de los voters
         prefetchBroadcast(queue[0].id, queue[0].duration || 0);
-        return cb({ song: queue[0] });
+        return cb({ song: conIntro(queue[0]) });
       }
       if (!db.getAutoDJEnabled()) return cb({ song: null });
       if (!pendingAutoDJ) pendingAutoDJ = await pickAutoDJSong();
       if (pendingAutoDJ) prefetchBroadcast(pendingAutoDJ.id, pendingAutoDJ.duration || 0);
-      cb({ song: pendingAutoDJ });
+      cb({ song: conIntro(pendingAutoDJ) });
     } catch (e) {
       console.error('player:peek-next error:', e.message);
       cb({ song: null });
@@ -1458,8 +1461,8 @@ io.on('connection', socket => {
   // Enviar log histórico de la sesión a la nueva conexión
   socket.emit('session:log:init', sessionLog);
 
-  // Silence config: send persisted values to new connection
-  socket.emit('player:silence-config', silenceConfig());
+  // El solapamiento es fijo: se manda solo para que el cliente lo muestre.
+  socket.emit('player:silence-config', { overlapSec: OVERLAP_SEC });
 
   // Crossfade config: send persisted value to new connection
   socket.emit('player:crossfade-config', {

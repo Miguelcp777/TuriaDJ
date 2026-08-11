@@ -193,7 +193,7 @@ onEnded / visibilitychange / skip
 |-----------|-------|-------------|
 | `CROSSFADE_MS` | 3000 | Duración del crossfade en ms |
 | `CROSSFADE_TICK` | 50 | ms entre pasos de volumen |
-| `SILENCE_THRESHOLD` | 0.02 | Amplitud RMS (~−34 dB) por debajo de la cual se considera silencio |
+| `SILENCE_THRESHOLD` | 0.02 | Amplitud RMS (~−34 dB) — detector local, hoy solo respaldo |
 | `SILENCE_SECONDS` | 2 | Segundos consecutivos de silencio antes de lanzar crossfade |
 | `SILENCE_WINDOW` | 60 | Ventana al final de la canción donde se activa la detección |
 
@@ -254,16 +254,12 @@ Resetear `preloadedRef` al inicio de `doCrossfade` y cuando llega `player:update
 
 ---
 
-### PV-003 — Ajuste de silencio desde RemoteView (P3, ~3h) ✅ Implementado 2026-05-24
+### PV-003 — Ajuste de silencio desde RemoteView (P3) ⛔ REVERTIDO 2026-08-11
 
-Exponer `SILENCE_THRESHOLD` y `SILENCE_SECONDS` como configuración editable desde `RemoteView` (panel del DJ), persitida en LocalStorage o en la DB.
-
-Requiere:
-1. Convertir las constantes de módulo en estado de React (`useState` + `useRef`)
-2. Añadir endpoint `POST /api/player/silence-config` (admin) que haga broadcast `player:silence-config`
-3. Panel de ajuste en RemoteView con dos sliders
-
-Útil para adaptar el comportamiento según el tipo de música (electrónica tiene silencios breves; baladas pueden tener fade-outs largos).
+Se implementó (dos sliders en RemoteView + `POST /api/player/silence-config`) y **se ha quitado**:
+no existe un par de valores que valga para toda la biblioteca, y el detector del navegador
+llegaba tarde. Ahora el punto de mezcla lo calcula el servidor por canción — ver
+"Regla del solapamiento". El endpoint sigue existiendo pero solo fuerza un recálculo.
 
 ---
 
@@ -317,29 +313,56 @@ Verificado E2E (Chromium, producción): resync background→foreground (canción
 
 ## Crossfade (✅ VERIFICADO funcionando 2026-06-01)
 
-El crossfade de N segundos (configurable 1–10s, default 4s) está verificado con test E2E en Chromium headless. Funciona en:
+El crossfade está verificado con test E2E en Chromium headless. Funciona en:
 
 - **PlayerView** (`/player`, reproductor físico) — dual audio A/B + `setInterval` ticks
 - **UnifiedView** (panel admin) — dual audio A/B + `requestAnimationFrame`
+- **Voters** (`/api/live`) — mezcla renderizada con ffmpeg en el servidor (ver más abajo)
 
-**NO funciona en:** modo voter (escucha `/api/live`) — el broadcast del servidor cambia abruptamente.
+### Regla del solapamiento (⚠️ reescrita 2026-08-11 — ya NO se configura)
 
-### Configuración
+**Las canciones se solapan 3 segundos. Punto.** Lo único que se calcula por canción es
+**dónde** arranca ese solape, y depende de cómo acabe la saliente:
 
-Persiste en `db.state.crossfade_ms` (default 4000). Editable desde:
-- `RemoteView` → slider "Duración del crossfade"
-- `UnifiedView` panel admin → pestaña Control → bloque "Crossfade y silencio"
-- `POST /api/player/crossfade-config` con `{ ms: number }` (admin)
+| Final de la saliente | Dónde entra la siguiente |
+|---|---|
+| Seco | 3 s antes del final del fichero |
+| Con silencio de cola | 3 s antes del final de la **música** (el silencio no cuenta) |
+| Con fundido | **2 s después de empezar el fundido** |
 
-Cambios se propagan vía `player:crossfade-config` socket event a todos los clientes.
+La regla vive en `mezcla.js` (`puntosDeMezcla`), **fuera de `server.js` a propósito**, para
+poder medirla contra la biblioteca real sin arrancar el servidor. Entra por parámetro una
+serie de niveles RMS del tramo final y salen `mixStartMs`, `audioEndMs` y `fadeMs`.
+
+Antes hubo dos mandos (umbral en dB y recorte máximo) en el panel y en RemoteView. Se han
+quitado: **no había un par de valores que valiese para toda la biblioteca**, y el mando de
+"duración del crossfade" (1–10 s) contradecía la regla de los 3 s. `crossfade_ms` sigue en
+la DB pero ya no lo lee nadie.
+
+#### Cómo se mide (dos trampas que cuestan horas)
+
+1. **`astats` imprime una línea por FRAME (~26 ms), no por ventana**, y dentro de una ventana
+   el valor es un RMS acumulado que va cayendo. `reset=N` a secas da una serie en dientes de
+   sierra, no la curva de la canción. La forma correcta es `asetnsamples` + `reset=1`
+   (constante `FILTRO_RMS` en `mezcla.js`).
+2. **`silencedetect` no sirve** para el final: exige nivel bajo *continuo* y un fundido con
+   golpes sueltos lo resetea. Sí sirve, en cambio, para el silencio **inicial**.
+
+#### Silencio con el que ARRANCA la entrante
+
+Medido: **7 de cada 20 canciones empiezan con silencio, la peor con 7,9 s**. Sin recortarlo el
+solape cae sobre la nada. `analizarIntro` lo mide con `silencedetect` cuando se precarga la
+siguiente (~90 s antes) y viaja al cliente como `introMs` en la cola, en `/api/player/next` y
+en `player:peek-next`. A/B sobre "Fantasy Girl": el solape terminaba en **−93,5 dB** (silencio
+digital) y ahora termina en −31 dB.
 
 ### Cuándo se dispara
 
 | Evento | Acción |
 |---|---|
-| Pre-trigger (`remaining ≤ crossfadeSecs + 1`) en `handleTimeUpdate` | **Crossfade** (objetivo principal) |
+| `currentTime ≥ mixStartMs` en `handleTimeUpdate` | **Crossfade de 3 s** (camino normal) |
 | `onEnded` (canción terminó sin pre-trigger) | Crossfade (cliente) o switch inmediato (fallback) |
-| Silencio detectado RMS < threshold durante `silenceSecs` (default 1s) | **Switch inmediato** (PV-003: la canción ya está en silencio, no hay nada que fade-out) |
+| Silencio detectado RMS < threshold durante `silenceSecs` (PlayerView) | **Switch inmediato** — respaldo: con `mixStartMs` la mezcla ya ha empezado antes |
 | Admin pulsa "Skip" (`handleSkip`) | **Switch inmediato** (acción explícita del DJ) |
 
 ### Precarga de la siguiente canción (CLAVE para el solapamiento)
@@ -447,6 +470,7 @@ También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-08-11 | **Regla de mezcla única: solapar 3 s, sin mandos** — se quitan los dos sliders de silencio (y el de duración del crossfade, que la contradecía). El servidor calcula por canción dónde entra la siguiente según su final (seco / silencio de cola / fundido) y lo manda como `mixStartMs`; sala, `/player` y móviles usan el mismo punto. ⚠️ Dos hallazgos: `astats` imprime **por frame**, no por ventana (había que agrupar con `asetnsamples`), y **7 de cada 20 canciones empiezan con silencio** (la peor 7,9 s) — sin recortarlo el solape terminaba en −93,5 dB. Verificado sobre **60 canciones** de la biblioteca real (17 secas, 16 con cola muda, 27 con fundido): el solape cae siempre sobre música. |
 | 2026-08-09 | **Acceso con cuenta de Google** — botón junto al formulario de siempre, que sigue funcionando. Flujo de *ID token*: el servidor verifica el JWT con `google-auth-library` (firma, emisor y audiencia); **no hay client secret que custodiar**. Se exige `email_verified`. Alta automática al primer acceso, vinculando por email si la cuenta ya existía. ⚠️ `password_hash` es NOT NULL y SQLite no deja quitarlo sin reconstruir la tabla: las cuentas de Google guardan un centinela `google:<aleatorio>` y el login por contraseña **rechaza explícitamente** lo que no empiece por `$2`. Todo inactivo si falta `GOOGLE_CLIENT_ID`. |
 | 2026-08-09 | **`bcrypt` nativo** — 60 logins simultáneos dejaban ~4,75 s sin audio a todos los oyentes (bcrypt bloquea el hilo que emite). ⚠️ Pasar de `compareSync` a `compare` NO arregla nada: `bcryptjs` es JS puro y su API asíncrona solo trocea el trabajo en el mismo hilo. El fix es `bcrypt` nativo, que usa el threadpool de libuv. Retraso máximo del emisor: 5347 ms → **2 ms**. `bcryptjs` queda como respaldo; los hashes son compatibles en ambos sentidos. |
 | 2026-08-09 | **Ritmo del broadcast por ms de audio, no por bytes** — `bcastBPS = fileSize/duration` se desviaba con VBR y despachaba 110 s de audio en ~85 s, dejando ~25 s mudos antes de cada cambio. ⚠️ No lo detecté antes porque las pruebas usaban avances forzados y ninguna canción llegaba a agotarse: **al probar el motor, dejar que la canción termine sola**. |
