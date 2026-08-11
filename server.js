@@ -111,7 +111,7 @@ function bcastTick() {
       prefetchBroadcast(esperado, nextUpDuration());   // precargar la correcta
       return;
     }
-    enterBridge();
+    enterBridge(esperado);
     return;
   }
 
@@ -392,14 +392,18 @@ function renderBridge(songA, startSec, songB, secs, srate, ch, yaBaja) {
 // Conmuta la emisión al segmento de mezcla ya renderizado. La canción A se
 // abandona aquí (su cola era silencio o estaba a punto de acabarse) y B queda
 // esperando en bcastAfterBridge.
-function enterBridge() {
+// Devuelve `true` solo si la emisión ha pasado de verdad a la mezcla. Quien la
+// llama TIENE que mirar el resultado: si se descarta la mezcla y el llamante da
+// por hecho que el relevo se ha hecho, el motor se queda emitiendo la canción
+// anterior mientras `bcastSongId` dice otra cosa (ver startBroadcast).
+// `esperado` es la canción hacia la que se quiere ir; si no coincide con la que
+// lleva dentro la mezcla, esa mezcla es de otro par de canciones.
+function enterBridge(esperado) {
   const b = bcastBridge;
-  if (!b || !b.ready || !bcastPrefetch || bcastPrefetch.songId !== b.songB) { bcastBridge = null; return; }
-  // Ultima verja: nunca mezclar hacia una cancion que ya no es la siguiente.
-  const esperado = nextUpId();
+  if (!b || !b.ready || !bcastPrefetch || bcastPrefetch.songId !== b.songB) { bcastBridge = null; return false; }
   if (esperado && b.songB !== esperado) {
     slog('broadcast:bridgeStale', { tenia: String(b.songB).slice(0, 8), toca: String(esperado).slice(0, 8) });
-    bcastBridge = null; return;
+    bcastBridge = null; return false;
   }
   slog('broadcast:crossfade', { secs: b.secs, kb: Math.round(b.buf.length/1024) });
   const prev = bcastSource;
@@ -421,6 +425,7 @@ function enterBridge() {
     sink: { pre: Buffer.alloc(0), synced: true, out: b.buf, skipped: 0,
             srate: prev?.sink.srate, ch: prev?.sink.ch }
   };
+  return true;
 }
 
 // El bridge se ha agotado: dar paso a B, saltando la parte que ya sonó mezclada.
@@ -557,9 +562,13 @@ function startBroadcast(songId, duration, offsetSec = 0) {
   if (bcastBridge && bcastBridge.ready && !bcastBridge.failed &&
       bcastBridge.songB === songId && bcastPrefetch && bcastPrefetch.songId === songId) {
     bcastPrefetch.durationSec = duration;
-    enterBridge();
-    bcastSongId = songId;
-    return;
+    // `songId` (no nextUpId) es hacia donde se va: en este punto la canción nueva
+    // YA es la que suena, y la "siguiente" es la de detrás. Con nextUpId aquí la
+    // mezcla se descartaba SIEMPRE por obsoleta.
+    if (enterBridge(songId)) { bcastSongId = songId; return; }
+    // Si la mezcla se descartó no se puede volver con `return`: el motor seguiría
+    // emitiendo la canción ANTERIOR mientras bcastSongId dice otra cosa, y minutos
+    // después una mezcla vieja dispararía sola. Se sigue con el relevo normal.
   }
   const myGen = ++bcastGen;
   // Relevo: si la precarga es justo esta canción, promocionarla. El audio ya está

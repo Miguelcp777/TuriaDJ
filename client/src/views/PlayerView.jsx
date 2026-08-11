@@ -155,7 +155,7 @@ export default function PlayerView() {
   // cae sobre la nada. El servidor mide ese silencio y lo manda en `introMs`.
   const saltarIntro = (el, song) => {
     const intro = ((song && song.introMs) || 0) / 1000;
-    if (!el || intro <= 0.3) return;
+    if (!el || intro < 1) return;   // por debajo de 1 s no compensa la busqueda
     const poner = () => { try { el.currentTime = intro; } catch (e) {} };
     if (el.readyState >= 1) poner();
     else el.addEventListener('loadedmetadata', poner, { once: true });
@@ -275,11 +275,20 @@ export default function PlayerView() {
     // Esperar a que esté listo para reproducir (HAVE_FUTURE_DATA = 3).
     // Si no esperamos, los primeros segundos del crossfade pueden ser silencio
     // mientras el navegador buferea la nueva canción.
-    if (next.readyState >= 3) {
+    // `seeking` importa: si se ha pedido saltar el silencio inicial, el elemento
+    // puede anunciar canplay con una busqueda en curso y no soltar un solo sonido
+    // durante todo el fundido.
+    if (next.readyState >= 3 && !next.seeking) {
       startPlay();
     } else {
-      const onCanPlay = () => { next.removeEventListener('canplay', onCanPlay); startPlay(); };
-      next.addEventListener('canplay', onCanPlay, { once: true });
+      const onCanPlay = () => {
+        if (next.readyState < 3 || next.seeking) return;
+        next.removeEventListener('canplay', onCanPlay);
+        next.removeEventListener('seeked',  onCanPlay);
+        startPlay();
+      };
+      next.addEventListener('canplay', onCanPlay);
+      next.addEventListener('seeked',  onCanPlay);
       // Fallback a 1.5s — empezar igual aunque el buffer no esté completo
       setTimeout(() => {
         if (!started && advancingRef.current) {

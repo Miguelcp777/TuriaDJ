@@ -1238,7 +1238,7 @@ export default function UnifiedView() {
     // silencio y el peor caso son casi 8 s. En una transición ya se saltaba; esto
     // cubre el arranque en seco (primera canción, skip, recarga del panel).
     const intro = (song.introMs || 0) / 1000;
-    if (intro > 0.3) {
+    if (intro >= 1) {
       const poner = () => { try { audioA.current.currentTime = intro; } catch (e) {} };
       if (audioA.current.readyState >= 1) poner();
       else audioA.current.addEventListener('loadedmetadata', poner, { once: true });
@@ -1386,6 +1386,18 @@ export default function UnifiedView() {
     inn.volume = 0;
     inn.src = '/api/stream/' + song.id;
     inn.load();
+    // Saltar el silencio inicial de la entrante. ⚠️ Hay que pedirlo CUANTO ANTES
+    // (en `loadedmetadata`), NO cuando ya se puede reproducir: pedido en `canplay`,
+    // el elemento se pone a buscar justo al arrancar el fundido, la entrante no
+    // suena hasta que termina la busqueda y se oye un hueco y luego la cancion
+    // entrando de golpe a todo volumen. Ademas, por debajo de 1 s no compensa: ese
+    // silencio no se nota y la busqueda si.
+    const intro = (song.introMs || 0) / 1000;
+    if (intro >= 1) {
+      const poner = () => { try { inn.currentTime = intro; } catch (e) {} };
+      if (inn.readyState >= 1) poner();
+      else inn.addEventListener('loadedmetadata', poner, { once: true });
+    }
     setNowPlaying(song);
     const startVol = out.volume > 0 ? out.volume : 1;
 
@@ -1415,18 +1427,15 @@ export default function UnifiedView() {
       crossfadeRaf.current = requestAnimationFrame(tick);
     };
 
-    // Muchas canciones empiezan con medio segundo (o siete) de silencio. Si se
-    // arranca en su segundo 0, el solape cae sobre la nada. El servidor mide ese
-    // silencio y lo manda en `introMs`.
-    const saltarIntro = () => {
-      const intro = (song.introMs || 0) / 1000;
-      if (intro > 0.3) { try { inn.currentTime = intro; } catch (e) {} }
-    };
-
-    // Esperar a que el nuevo audio esté listo para reproducir
-    const onCanPlay = () => {
-      inn.removeEventListener('canplay', onCanPlay);
-      saltarIntro();
+    // El fundido no puede empezar hasta que la entrante pueda sonar DE VERDAD:
+    // con datos suficientes y sin una busqueda en curso. Si no, se le baja el
+    // volumen a la saliente mientras la entrante todavia esta callada.
+    let arrancado = false;
+    const arrancar = () => {
+      if (arrancado) return;
+      arrancado = true;
+      inn.removeEventListener('canplay', siListo);
+      inn.removeEventListener('seeked',  siListo);
       inn.play().then(beginFade).catch(() => {
         // Si play falla (autoplay policy), hacer cambio brusco
         if (out) { out.pause(); out.src = ''; out.volume = startVol; }
@@ -1434,17 +1443,14 @@ export default function UnifiedView() {
         fadeScheduled.current = false;
       });
     };
-    if (inn.readyState >= 3) onCanPlay();
-    else inn.addEventListener('canplay', onCanPlay, { once: true });
+    const siListo = () => { if (inn.readyState >= 3 && !inn.seeking) arrancar(); };
+    inn.addEventListener('canplay', siListo);
+    inn.addEventListener('seeked',  siListo);
+    siListo();
 
-    // Fallback si canplay no llega en 2s: empezar igualmente
-    setTimeout(() => {
-      if (fadeScheduled.current && inn.readyState < 3) {
-        inn.removeEventListener('canplay', onCanPlay);
-        saltarIntro();
-        inn.play().then(beginFade).catch(() => { fadeScheduled.current = false; });
-      }
-    }, 2000);
+    // Fallback: si en 3 s sigue sin estar listo, arrancar igualmente. Antes eran
+    // 2 s, insuficientes cuando ademas hay que buscar el arranque de la cancion.
+    setTimeout(() => { if (fadeScheduled.current) arrancar(); }, 3000);
   };
 
   // Crossfade con canción de la cola (la canción ya se conoce → audio arranca sin esperar servidor)
