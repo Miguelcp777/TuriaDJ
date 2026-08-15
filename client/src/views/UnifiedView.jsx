@@ -1407,9 +1407,16 @@ export default function UnifiedView() {
       cancelAnimationFrame(crossfadeRaf.current);
       let lastLogP = -1;
       const tick = (now) => {
-        const p = Math.min((now - t0) / fadeMs, 1);
-        if (out) out.volume = startVol * (1 - p);
-        if (inn) inn.volume = p * startVol;
+        // ⚠️ `now` es la marca de tiempo del FOTOGRAMA, y ese fotograma pudo
+        // empezar ANTES de que se leyera `t0`: sin acotar por abajo, `p` sale
+        // negativo, `1 - p` pasa de 1 y asignar ese volumen lanza IndexSizeError.
+        // La excepcion mataba el bucle en su primer paso: la saliente se quedaba
+        // a tope, la entrante a cero y al acabar la cancion se oia el corte seco
+        // con la siguiente entrando de golpe. Era la causa del fallo reportado.
+        const p = Math.max(0, Math.min((now - t0) / fadeMs, 1));
+        const vol = v => Math.max(0, Math.min(1, v));
+        if (out) out.volume = vol(startVol * (1 - p));
+        if (inn) inn.volume = vol(p * startVol);
         // Log every 25% progress
         if (p - lastLogP >= 0.25 || p === 1) {
           lastLogP = p;
