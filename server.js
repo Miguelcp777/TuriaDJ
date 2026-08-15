@@ -51,7 +51,9 @@ let bcastAfterBridge= null;  // { src, skipMs } canción que retoma tras la mezc
 // ── Log de diagnóstico por sesión ────────────────────────────────────────────
 // Se resetea en cada inicio/fin de sesión. Registra eventos clave del motor de
 // avance (servidor) y del cliente PlayerView (vía socket 'client:log').
-const SESSION_LOG_MAX = 300;
+// 300 se quedaba corto para revisar una sesion entera: 20 canciones son ~260
+// eventos solo del motor, y ademas el panel ya manda los suyos.
+const SESSION_LOG_MAX = 900;
 let sessionLog       = [];
 let sessionStartTime = 0;
 
