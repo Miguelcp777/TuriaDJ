@@ -379,6 +379,25 @@ A/B medidos sobre "Fantasy Girl": el solape de una transición terminaba en **�
 | Silencio detectado RMS < threshold durante `silenceSecs` (PlayerView) | **Switch inmediato** — respaldo: con `mixStartMs` la mezcla ya ha empezado antes |
 | Admin pulsa "Skip" (`handleSkip`) | **Switch inmediato** (acción explícita del DJ) |
 
+### ⚠️ Dos fallos que rompían el crossfade del panel (corregidos 2026-08-15)
+
+**1. `rAF` puede entregar una marca de tiempo ANTERIOR a `t0`.** El bucle del
+fundido calculaba `p = Math.min((now - t0) / fadeMs, 1)` sin acotar por abajo.
+`requestAnimationFrame` pasa la marca del **fotograma**, y ese fotograma pudo
+empezar antes de que se leyera `t0`: con `now < t0`, `p` sale negativo, `1 - p`
+pasa de 1 y asignar ese volumen lanza `IndexSizeError`. La excepción mataba el
+bucle **en su primer paso**: saliente clavada a tope, entrante a cero, y al
+acabar la canción `handleEnded` cortaba en seco con la siguiente entrando de
+golpe. Acotar `p` a `[0,1]` (y el volumen antes de asignarlo) es todo el fix.
+Sale por consola, no leyendo el código: **capturar `pageerror` en los tests E2E**.
+
+**2. El panel no precargaba la siguiente canción.** `PlayerView` sí (PV-002),
+pero `UnifiedView` —el que suena en la sala— ponía el `src` de la entrante *en el
+instante* de la mezcla. Con la regla nueva eso son 3 s antes del final: si la
+descarga tardaba más, la saliente se acababa y se oía el corte. Ahora
+`precargarSiguiente()` la baja **45 s antes** del punto de mezcla (cola o
+`player:peek-next` en AutoDJ) y `startCrossfade` no toca el `src` si ya está lista.
+
 ### Precarga de la siguiente canción (CLAVE para el solapamiento)
 
 Para que el crossfade SOLAPE de verdad, la siguiente canción debe estar bufferada **antes** de empezar el fade. `preloadNext()` (en `handleTimeUpdate`, ~90s antes del final) la carga en el elemento `<audio>` inactivo:
@@ -484,6 +503,7 @@ También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-08-15 | **Crossfade del panel arreglado de raíz** — dos fallos: (a) el bucle del fundido moría en su primer fotograma por un `IndexSizeError` al asignar un volumen > 1 (`rAF` entrega la marca del fotograma, que puede ser anterior a `t0` → `p` negativo); (b) el panel **no precargaba** la siguiente canción y la cargaba en el instante de la mezcla, 3 s antes del final. Verificado en Chromium con red estrangulada sobre transiciones reales, 4 casos (entrante normal, con 7,9 s de silencio inicial, con 1 s, y AutoDJ): **2,8 s de solape real y 0,00 s de silencio en los cuatro**. ⚠️ El primero solo se encontró **capturando `pageerror` de la página** en el test. |
 | 2026-08-11 | **Silencio inicial recortado en TODO arranque** — el recorte solo se aplicaba dentro de una transición, así que la primera canción de la sesión, un skip del DJ o una recarga del panel emitían el silencio entero. Censo: **44% de la biblioteca empieza con algo de silencio, 13% con 1 s o más**. A/B sobre "Fantasy Girl" arrancando en seco: **17 ventanas mudas de 0,5 s → 0**. |
 | 2026-08-11 | **Regla de mezcla única: solapar 3 s, sin mandos** — se quitan los dos sliders de silencio (y el de duración del crossfade, que la contradecía). El servidor calcula por canción dónde entra la siguiente según su final (seco / silencio de cola / fundido) y lo manda como `mixStartMs`; sala, `/player` y móviles usan el mismo punto. ⚠️ Dos hallazgos: `astats` imprime **por frame**, no por ventana (había que agrupar con `asetnsamples`), y **7 de cada 20 canciones empiezan con silencio** (la peor 7,9 s) — sin recortarlo el solape terminaba en −93,5 dB. Verificado sobre **60 canciones** de la biblioteca real (17 secas, 16 con cola muda, 27 con fundido): el solape cae siempre sobre música. |
 | 2026-08-09 | **Acceso con cuenta de Google** — botón junto al formulario de siempre, que sigue funcionando. Flujo de *ID token*: el servidor verifica el JWT con `google-auth-library` (firma, emisor y audiencia); **no hay client secret que custodiar**. Se exige `email_verified`. Alta automática al primer acceso, vinculando por email si la cuenta ya existía. ⚠️ `password_hash` es NOT NULL y SQLite no deja quitarlo sin reconstruir la tabla: las cuentas de Google guardan un centinela `google:<aleatorio>` y el login por contraseña **rechaza explícitamente** lo que no empiece por `$2`. Todo inactivo si falta `GOOGLE_CLIENT_ID`. |
