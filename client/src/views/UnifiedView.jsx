@@ -886,6 +886,12 @@ export default function UnifiedView() {
   const activeRef     = useRef('A');          // which element is the current player
   const fadeScheduled = useRef(false);        // crossfade has been triggered
   const crossfadeRaf  = useRef(null);         // requestAnimationFrame handle
+  // Id de la cancion ya bajada y esperando en el elemento inactivo. Sin esto el
+  // panel cargaba la entrante EN EL INSTANTE de la mezcla, que son 3 s antes del
+  // final: si tardaba mas, la saliente se acababa, se cortaba en seco y la
+  // entrante aparecia de golpe al terminar de bajar. Es la causa del corte.
+  const precargadaRef = useRef('');
+  const peekEnCurso   = useRef(false);
 
   const getActive   = () => activeRef.current === 'A' ? audioA.current : audioB.current;
   const getInactive = () => activeRef.current === 'A' ? audioB.current : audioA.current;
@@ -1229,6 +1235,7 @@ export default function UnifiedView() {
   const loadAndPlay = (song) => {
     cancelAnimationFrame(crossfadeRaf.current);
     fadeScheduled.current = false;
+    precargadaRef.current = '';       // se van a limpiar los dos elementos
     [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
     activeRef.current = 'A';
     if (!audioA.current || !song) return;
@@ -1384,19 +1391,12 @@ export default function UnifiedView() {
     if (!out || !inn) { fadeScheduled.current = false; return; }
     const fadeMs = (crossfadeConfig.overlapSec || 3) * 1000;
     inn.volume = 0;
-    inn.src = '/api/stream/' + song.id;
-    inn.load();
-    // Saltar el silencio inicial de la entrante. ⚠️ Hay que pedirlo CUANTO ANTES
-    // (en `loadedmetadata`), NO cuando ya se puede reproducir: pedido en `canplay`,
-    // el elemento se pone a buscar justo al arrancar el fundido, la entrante no
-    // suena hasta que termina la busqueda y se oye un hueco y luego la cancion
-    // entrando de golpe a todo volumen. Ademas, por debajo de 1 s no compensa: ese
-    // silencio no se nota y la busqueda si.
-    const intro = (song.introMs || 0) / 1000;
-    if (intro >= 1) {
-      const poner = () => { try { inn.currentTime = intro; } catch (e) {} };
-      if (inn.readyState >= 1) poner();
-      else inn.addEventListener('loadedmetadata', poner, { once: true });
+    // Si ya estaba precargada no se toca el src: el audio esta en memoria y el
+    // fundido puede empezar en el acto. Solo se carga aqui como ultimo recurso.
+    const yaLista = precargadaRef.current === song.id && inn.readyState >= 3;
+    if (!yaLista) {
+      console.log(`[crossfade] la entrante NO estaba precargada, cargando ahora`);
+      cargarEnInactivo(song);
     }
     setNowPlaying(song);
     const startVol = out.volume > 0 ? out.volume : 1;
@@ -1421,6 +1421,7 @@ export default function UnifiedView() {
           if (out) { out.pause(); out.src = ''; out.volume = startVol; }
           activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
           fadeScheduled.current = false;
+          precargadaRef.current = '';       // el hueco de precarga queda libre
           console.log(`[crossfade] DONE → active=${activeRef.current}`);
         }
       };
@@ -1448,9 +1449,53 @@ export default function UnifiedView() {
     inn.addEventListener('seeked',  siListo);
     siListo();
 
-    // Fallback: si en 3 s sigue sin estar listo, arrancar igualmente. Antes eran
-    // 2 s, insuficientes cuando ademas hay que buscar el arranque de la cancion.
-    setTimeout(() => { if (fadeScheduled.current) arrancar(); }, 3000);
+    // Ultimo recurso: si no estaba precargada y en 1,5 s aun no puede sonar, se
+    // arranca igual. Mas espera no ayuda — la saliente se estaria acabando.
+    setTimeout(() => { if (fadeScheduled.current) arrancar(); }, 1500);
+  };
+
+  // Deja la cancion bajada y lista en el elemento inactivo, con su silencio
+  // inicial ya saltado. Se llama con MUCHA antelacion (ver handleTimeUpdate).
+  const cargarEnInactivo = (song) => {
+    const inn = getInactive();
+    if (!inn || !song) return;
+    inn.volume  = 0;
+    inn.preload = 'auto';
+    inn.src     = '/api/stream/' + song.id;
+    inn.load();
+    // El silencio inicial se salta AQUI, con tiempo de sobra para que termine la
+    // busqueda. Pedirlo en mitad del fundido dejaba la entrante muda.
+    const intro = (song.introMs || 0) / 1000;
+    if (intro >= 1) {
+      const poner = () => { try { inn.currentTime = intro; } catch (e) {} };
+      if (inn.readyState >= 1) poner();
+      else inn.addEventListener('loadedmetadata', poner, { once: true });
+    }
+    precargadaRef.current = song.id;
+  };
+
+  // Cual sonara despues: manda la cola y, si esta vacia, la eleccion de AutoDJ
+  // (el servidor la memoiza, asi que sera exactamente esa).
+  const precargarSiguiente = () => {
+    if (fadeScheduled.current) return;
+    const siguiente = queue[0];
+    if (siguiente) {
+      if (precargadaRef.current !== siguiente.id) {
+        console.log(`[crossfade] precargando "${siguiente.title}"`);
+        cargarEnInactivo(siguiente);
+      }
+      return;
+    }
+    if (!autoDJEnabled || precargadaRef.current || peekEnCurso.current) return;
+    peekEnCurso.current = true;
+    socket.emit('player:peek-next', {}, (data) => {
+      peekEnCurso.current = false;
+      const s = data && data.song;
+      if (s && !fadeScheduled.current && precargadaRef.current !== s.id) {
+        console.log(`[crossfade] precargando (AutoDJ) "${s.title}"`);
+        cargarEnInactivo(s);
+      }
+    });
   };
 
   // Crossfade con canción de la cola (la canción ya se conoce → audio arranca sin esperar servidor)
@@ -1484,6 +1529,10 @@ export default function UnifiedView() {
     const overlap = nowPlaying?.overlapSec || 3;
     const entrada = nowPlaying?.mixStartMs ? nowPlaying.mixStartMs / 1000
                                            : Math.max(0, dur - overlap);
+    // Bajar la siguiente MUCHO antes de necesitarla. Con 45 s de margen da tiempo
+    // de sobra aunque la red vaya justa, y al llegar el punto de mezcla el
+    // fundido arranca en el acto en vez de esperar a que cargue.
+    if (isAdmin && entrada > 1 && entrada - ct <= 45 && !fadeScheduled.current) precargarSiguiente();
     if (isAdmin && entrada > 1 && ct >= entrada && !fadeScheduled.current) {
       console.log(`[crossfade] entra la siguiente en ${ct.toFixed(1)}s (previsto ${entrada.toFixed(1)}s, dur=${dur.toFixed(1)}s, solape=${overlap}s)`);
       fadeScheduled.current = true;
@@ -1508,9 +1557,12 @@ export default function UnifiedView() {
       cancelAnimationFrame(crossfadeRaf.current);
       const out = getActive(); const inn = getInactive();
       if (out) { out.pause(); out.src = ''; out.volume = 1; }
-      if (inn) inn.volume = 1;
+      // La entrante puede no haber arrancado todavia: si no se le da al play
+      // aqui, no suena nada hasta que llegue un player:update del servidor.
+      if (inn) { inn.volume = 1; if (inn.paused && inn.src) inn.play().catch(() => {}); }
       activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
       fadeScheduled.current = false;
+      precargadaRef.current = '';
       setIsPlaying(true);
       return;
     }
