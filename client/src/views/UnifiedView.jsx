@@ -1438,9 +1438,16 @@ export default function UnifiedView() {
         // a tope, la entrante a cero y al acabar la cancion se oia el corte seco
         // con la siguiente entrando de golpe. Era la causa del fallo reportado.
         const p = Math.max(0, Math.min((now - t0) / fadeMs, 1));
+        // Curva de POTENCIA CONSTANTE, no lineal. Con una rampa lineal, a mitad
+        // del fundido los dos temas estan a 0,5 y la potencia combinada es
+        // 0,5² + 0,5² = 0,5 → un hoyo de -3 dB en el centro de CADA mezcla, que
+        // se oye como un bache y como que la entrante "sube de golpe" despues.
+        // Con seno/coseno se cumple cos²+sen² = 1 y el volumen percibido no baja.
         const vol = v => Math.max(0, Math.min(1, v));
-        if (out) out.volume = vol(startVol * (1 - p));
-        if (inn) inn.volume = vol(p * startVol);
+        const fuera = Math.cos(p * Math.PI / 2);
+        const dentro = Math.sin(p * Math.PI / 2);
+        if (out) out.volume = vol(startVol * fuera);
+        if (inn) inn.volume = vol(startVol * dentro);
         // Log every 25% progress
         if (p - lastLogP >= 0.25 || p === 1) {
           lastLogP = p;

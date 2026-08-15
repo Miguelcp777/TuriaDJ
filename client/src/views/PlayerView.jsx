@@ -236,8 +236,10 @@ export default function PlayerView() {
       crossfadeTimer.current = setInterval(() => {
         step++;
         const t = Math.min(1, step / totalSteps);
-        current.volume = (1 - t) * vol;
-        next.volume    = t * vol;
+        // Potencia constante (cos/sen), no rampa lineal: con la lineal, a mitad
+        // del fundido ambos van a 0,5 y la potencia cae -3 dB → bache audible.
+        current.volume = Math.max(0, Math.min(1, Math.cos(t * Math.PI / 2) * vol));
+        next.volume    = Math.max(0, Math.min(1, Math.sin(t * Math.PI / 2) * vol));
         // Log every ~500ms (10 ticks)
         if (step % 10 === 0 || step === totalSteps) {
           console.log(`[crossfade] step ${step}/${totalSteps}  out=${current.volume.toFixed(2)}  in=${next.volume.toFixed(2)}`);
