@@ -60,6 +60,62 @@ let sessionLog       = [];
 let ultimoProgresoAt = 0;
 let sessionStartTime = 0;
 
+// ── El mando ─────────────────────────────────────────────────────────────────
+// QUIEN reproduce y dirige, separado de quien ha iniciado sesion. Cualquier
+// admin puede estar identificado a la vez; solo UNO tiene el mando.
+//
+// Hace falta porque el panel es quien dirige la reproduccion: con dos paneles
+// abiertos, los dos piden el avance en el mismo instante (se salta una cancion)
+// y los dos escriben la posicion de la sesion.
+//
+// `null` = mando libre. Se limpia al iniciar/terminar fiesta.
+let mando = null;   // { deviceId, nombre, username, socketId, desde, latido }
+
+// Sin latido en este tiempo, el mando queda libre. Es la salvaguarda que evita
+// quedarse bloqueado fuera si el movil se queda sin bateria o el navegador se
+// cierra en seco: sin esto, un dispositivo muerto inutilizaria la app.
+const MANDO_TTL_MS = 30000;
+
+function mandoVivo() {
+  if (!mando) return null;
+  if (Date.now() - mando.latido > MANDO_TTL_MS) { mando = null; return null; }
+  return mando;
+}
+const tieneMando = deviceId => { const m = mandoVivo(); return !!m && !!deviceId && m.deviceId === deviceId; };
+
+// Corta las ordenes de quien no tiene el mando. Solo bloquea si el mando esta
+// EN MANOS DE OTRO: con el mando libre todo funciona igual que siempre, para no
+// dejar la app inservible si nadie lo ha reclamado.
+function soloMando(req, res, next) {
+  const actual = mandoVivo();
+  if (actual && actual.deviceId !== req.headers['x-device-id']) {
+    return res.status(409).json({ error: 'Otro dispositivo tiene el control de la reproduccion',
+                                  mando: { nombre: actual.nombre, desde: actual.desde } });
+  }
+  next();
+}
+
+function soltarMando(motivo) {
+  if (!mando) return;
+  slog('mando:suelta', { de: mando.nombre, motivo });
+  mando = null;
+  io.emit('control:estado', { ocupado: false });
+}
+
+function darMando(socket, { deviceId, nombre, username }) {
+  const previo = mandoVivo();
+  if (previo && previo.deviceId !== deviceId) {
+    // Al anterior se le cierra la sesion del todo (decision del DJ): recibe el
+    // aviso, para el audio y vuelve al login.
+    io.to(previo.socketId).emit('control:revocado', { porQuien: nombre || 'otro dispositivo' });
+    slog('mando:traspaso', { de: previo.nombre, a: nombre });
+  }
+  mando = { deviceId, nombre: nombre || 'dispositivo', username,
+            socketId: socket.id, desde: Date.now(), latido: Date.now() };
+  slog('mando:toma', { quien: mando.nombre });
+  io.emit('control:estado', { ocupado: true, nombre: mando.nombre, desde: mando.desde });
+}
+
 // Devuelve cuántos bytes se pueden cortar del buffer sin partir un frame, para
 // llegar lo más cerca posible de `target`. Emitir media trama hace que el
 // decodificador del oyente escupa "Header missing" — y al cambiar de canción
@@ -870,7 +926,7 @@ app.post('/api/session/info', auth.adminMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
+app.post('/api/session/start', auth.adminMiddleware, soloMando, (req, res) => {
   const { duration } = req.body || {};
   resetRuntimeState();   // baseline limpio: que la sesión nueva no herede estado viejo
   slog('session:start', { duration: duration || 0 });
@@ -882,12 +938,12 @@ app.post('/api/session/start', auth.adminMiddleware, (req, res) => {
     startSessionTimer(Date.now() + Number(duration) * 60 * 1000);
   } else {
     db.setSetting('session_end_time', '');
-    io.emit('session:timer', { endsAt: null });
+    emitirTiempos(null);
   }
   res.json({ success: true });
 });
 
-app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
+app.post('/api/session/end', auth.adminMiddleware, soloMando, (req, res) => {
   slog('session:end');
   clearSessionTimer();
   clearSongEndTimer();
@@ -903,7 +959,24 @@ app.post('/api/session/end', auth.adminMiddleware, (req, res) => {
   res.json({ success: true });
 });
 
-app.post('/api/session/extend', auth.adminMiddleware, (req, res) => {
+// Margen de inactividad, en minutos. 0 = no cerrar nunca por inactividad.
+app.post('/api/session/inactividad', auth.adminMiddleware, soloMando, (req, res) => {
+  const { minutos } = req.body || {};
+  const v = Math.max(0, Math.min(720, parseInt(minutos, 10) || 0));
+  db.setSetting('session_inactividad_min', String(v));
+  marcarActividad('cambia el margen');
+  emitirTiempos();
+  res.json({ success: true, minutos: v });
+});
+
+// "Seguimos aqui": el admin retira el aviso sin tener que tocar nada mas.
+app.post('/api/session/sigo', auth.adminMiddleware, (req, res) => {
+  marcarActividad('sigo aqui');
+  emitirTiempos();
+  res.json({ success: true, hasta: finPorInactividad() });
+});
+
+app.post('/api/session/extend', auth.adminMiddleware, soloMando, (req, res) => {
   const { minutes } = req.body || {};
   if (!minutes || Number(minutes) <= 0) return res.status(400).json({ error: 'Minutos inválidos' });
   const stored = db.getSetting('session_end_time');
@@ -980,6 +1053,7 @@ app.post('/api/queue/add', auth.authMiddleware, (req, res) => {
     return res.status(429).json({ error: 'Maximo 2 canciones cada 4 minutos. Podras anadir en ' + when });
   }
   if (!db.getSong(song.id)) db.addToQueue(song);
+  marcarActividad('añade cancion');
   // Medir ya si arranca con silencio: cuando le toque sonar el dato estara listo,
   // venga por una transicion o por un arranque en seco.
   analizarIntro(song.id);
@@ -989,6 +1063,7 @@ app.post('/api/queue/add', auth.authMiddleware, (req, res) => {
 });
 
 app.post('/api/queue/vote', auth.authMiddleware, (req, res) => {
+  marcarActividad('vota');
   if (req.user.role !== 'admin' && !db.getSessionActive())
     return res.status(403).json({ error: 'La sesion no esta activa' });
   const { songId } = req.body;
@@ -1014,6 +1089,7 @@ app.post('/api/queue/:id/pin', auth.adminMiddleware, (req, res) => {
 });
 
 app.delete('/api/queue', auth.adminMiddleware, (req, res) => {
+  marcarActividad('vacia la cola');
   db.clearQueue();
   broadcast();
   res.json({ success: true });
@@ -1163,6 +1239,18 @@ async function advanceQueue({ auto = false } = {}) {
 
 app.post('/api/player/next', auth.adminMiddleware, async (req, res) => {
   try {
+    // Un skip a mano lo puede pedir cualquier admin — tambien RemoteView, que
+    // es un mando a distancia legitimo y no reproduce. Lo que NO se acepta de
+    // otro dispositivo es el avance AUTOMATICO de una mezcla: ahi es donde una
+    // pestaña zombi hace daño (dos avances a la vez = cancion saltada).
+    if (!(req.body && req.body.porMezcla)) marcarActividad('skip del DJ');
+    if (req.body && req.body.porMezcla) {
+      const actual = mandoVivo();
+      if (actual && actual.deviceId !== req.headers['x-device-id']) {
+        slog('mando:rechazado', { ruta: 'player/next' });
+        return res.status(409).json({ error: 'Otro dispositivo tiene el control' });
+      }
+    }
     const song = await advanceQueue();
     res.json({ song: conIntro(song) });
   } catch (e) {
@@ -1376,8 +1464,72 @@ function startSessionTimer(endsAtMs) {
   const delay = endsAtMs - Date.now();
   if (delay <= 0) { autoEndSession(); return; }
   sessionTimer = setTimeout(autoEndSession, delay);
-  io.emit('session:timer', { endsAt: endsAtMs });
+  emitirTiempos(endsAtMs);
 }
+
+// Los dos vencimientos juntos: la hora fija de fin (si la hay) y el momento en
+// que caducaria por inactividad. El cliente pinta el mas cercano.
+function emitirTiempos(endsAtMs) {
+  const guardado = db.getSetting('session_end_time');
+  io.emit('session:timer', {
+    endsAt: endsAtMs !== undefined ? endsAtMs : (guardado ? parseInt(guardado) : null),
+    inactivoHasta: finPorInactividad(),
+    inactividadMin: inactividadMin(),
+  });
+}
+
+// ── Cierre por inactividad ───────────────────────────────────────────────────
+// Distinto de la duracion fija: aquella corta a una hora concreta ("la fiesta
+// acaba a las 2:00"), esta cierra lo que se ha quedado olvidado. El caso real
+// que la motiva: una sesion abierta 6,5 h y 97 canciones sin que nadie la
+// escuchara, con 96 de los 97 avances pedidos por el temporizador de seguridad.
+const AVISO_MIN = 15;              // aviso al admin cuando quedan estos minutos
+let ultimaActividad = 0;
+let avisoInactividadDado = false;
+
+const inactividadMin = () => parseInt(db.getSetting('session_inactividad_min') || '120', 10);
+
+// ⚠️ Llamar SOLO desde acciones humanas (votar, añadir, chat, entrar, tocar el
+// panel) y desde un mando vivo reproduciendo. NUNCA desde `advanceQueue`, el
+// puente ni AutoDJ: si el motor avanzando canciones contase como actividad, la
+// sesion olvidada no caducaria jamas y esto no serviria para nada.
+function marcarActividad(que) {
+  ultimaActividad = Date.now();
+  if (avisoInactividadDado) {
+    avisoInactividadDado = false;
+    io.emit('session:aviso', { minutos: null });   // retirar el aviso
+    slog('inactividad:revive', { por: que });
+  }
+}
+
+function revisarInactividad() {
+  if (!db.getSessionActive()) return;
+  const min = inactividadMin();
+  if (!min || min <= 0) return;                     // desactivado
+  if (!ultimaActividad) ultimaActividad = Date.now();
+  const restanMs = min * 60000 - (Date.now() - ultimaActividad);
+  if (restanMs <= 0) {
+    slog('inactividad:cierra', { min });
+    autoEndSession();
+    return;
+  }
+  emitirTiempos();   // refrescar el contador de la pantalla una vez por minuto
+  if (restanMs <= AVISO_MIN * 60000 && !avisoInactividadDado) {
+    avisoInactividadDado = true;
+    slog('inactividad:aviso', { min: Math.ceil(restanMs / 60000) });
+    io.emit('session:aviso', { minutos: Math.ceil(restanMs / 60000) });
+  }
+}
+// Cada 20 s, no cada minuto: con 60 s el cierre se iba hasta un minuto tarde y
+// el aviso de los 15 min caia con la misma imprecision.
+setInterval(revisarInactividad, 20000);
+
+// Cuanto queda por inactividad, para que el cliente pinte el contador.
+const finPorInactividad = () => {
+  const min = inactividadMin();
+  if (!min || min <= 0 || !ultimaActividad) return null;
+  return ultimaActividad + min * 60000;
+};
 
 function clearSessionTimer() {
   if (sessionTimer) { clearTimeout(sessionTimer); sessionTimer = null; }
@@ -1406,6 +1558,13 @@ function resetRuntimeState() {
   lastAutoAdvanceAt   = 0;                // limpia ventana de debounce de auto-avance
   lastProgress        = { position: 0 };  // posición reportada a 0
   ultimoProgresoAt    = 0;                // nadie dirige hasta que alguien reporte
+  ultimaActividad     = Date.now();       // el reloj de inactividad empieza ahora
+  avisoInactividadDado = false;
+  // ⚠️ El mando NO se toca aqui. `resetRuntimeState` corre al iniciar la fiesta,
+  // y el DJ acaba de coger el mando al abrir el panel: borrarlo le dejaria sin
+  // control justo despues de pulsar "Iniciar", y otro dispositivo podria cogerlo
+  // sin que saliera ningun aviso. El mando va con el dispositivo, no con la
+  // fiesta, y solo caduca por falta de latido.
   pendingAutoDJ       = null;             // descarta peek-next memoizado de la sesión anterior
   autoDJActive        = false;
   chatMessages.length = 0;                // vacía buffer de chat (mutar array const)
@@ -1433,14 +1592,48 @@ io.on('connection', socket => {
   socket.emit('session:update', { active: db.getSessionActive(), name: db.getSessionName(), desc: db.getSessionDesc() });
   socket.emit('autodj:update',  { enabled: db.getAutoDJEnabled(), active: autoDJActive });
   const storedEnd = db.getSetting('session_end_time');
-  socket.emit('session:timer',  { endsAt: storedEnd ? parseInt(storedEnd) : null });
+  socket.emit('session:timer',  { endsAt: storedEnd ? parseInt(storedEnd) : null,
+                                  inactivoHasta: finPorInactividad(),
+                                  inactividadMin: inactividadMin() });
   // Send current online list to this socket
   const list = [...onlineUsers.values()];
   socket.emit('users:online', { count: list.length, users: list });
 
+  const m0 = mandoVivo();
+  socket.emit('control:estado', m0 ? { ocupado: true, nombre: m0.nombre, desde: m0.desde }
+                                   : { ocupado: false });
+
   socket.on('user:join', ({ username, role }) => {
     onlineUsers.set(socket.id, { username, role });
+    marcarActividad('entra ' + (username || '?'));
     broadcastOnline();
+  });
+
+  // ── El mando ───────────────────────────────────────────────────────────────
+  // `pedir` no arrebata nunca: si esta ocupado devuelve por quien, y es el panel
+  // el que pregunta al DJ si quiere tomarlo. `tomar` si arrebata.
+  socket.on('control:pedir', ({ deviceId, nombre, username } = {}, cb) => {
+    if (typeof cb !== 'function') return;
+    if (!deviceId) return cb({ ok: false });
+    const actual = mandoVivo();
+    if (actual && actual.deviceId !== deviceId)
+      return cb({ ok: false, ocupado: { nombre: actual.nombre, desde: actual.desde } });
+    darMando(socket, { deviceId, nombre, username });
+    cb({ ok: true });
+  });
+
+  socket.on('control:tomar', ({ deviceId, nombre, username } = {}, cb) => {
+    if (!deviceId) return typeof cb === 'function' && cb({ ok: false });
+    darMando(socket, { deviceId, nombre, username });
+    if (typeof cb === 'function') cb({ ok: true });
+  });
+
+  socket.on('control:latido', ({ deviceId } = {}) => {
+    if (tieneMando(deviceId)) { mando.latido = Date.now(); mando.socketId = socket.id; }
+  });
+
+  socket.on('control:soltar', ({ deviceId } = {}) => {
+    if (tieneMando(deviceId)) soltarMando('lo ha soltado el dispositivo');
   });
 
   socket.on('user:leave', () => {
@@ -1451,6 +1644,9 @@ io.on('connection', socket => {
   socket.on('disconnect', () => {
     onlineUsers.delete(socket.id);
     chatRateLimit.delete(socket.id);
+    // Si se cae quien tenia el mando, NO se libera al instante: en el movil el
+    // socket se cae al bloquear la pantalla y volveria a pedirlo al reconectar.
+    // Se deja caducar por falta de latido (MANDO_TTL_MS).
     broadcastOnline();
   });
 
@@ -1459,8 +1655,18 @@ io.on('connection', socket => {
   socket.on('player:state', data => socket.broadcast.emit('player:state', data));
 
   socket.on('player:progress', data => {
+    // Solo la posicion del dispositivo al mando. Antes la escribia cualquiera:
+    // un movil con el JS viejo en cache corrompia la posicion de toda la sesion.
+    const alMando = mandoVivo();
+    if (alMando && alMando.deviceId !== (data && data.deviceId)) return;
     lastProgress = data || { position: 0 };
     ultimoProgresoAt = Date.now();   // hay un reproductor vivo dirigiendo
+    // Un mando vivo REPRODUCIENDO cuenta como actividad: el caso mas comun es
+    // el admin que engancha el altavoz y la gente baila sin tocar el movil, con
+    // cero interacciones durante horas. Sin esto la fiesta se cerraria sola en
+    // mitad del baile. Ojo: que AutoDJ avance canciones NO cuenta (ver
+    // marcarActividad) — esa es justo la sesion olvidada que se quiere cerrar.
+    if (alMando) marcarActividad('reproduciendo');
     // Reanudacion tras reiniciar el servicio a mitad de cancion. startBroadcast
     // solo se llamaba al AVANZAR de tema, asi que los oyentes de /api/live se
     // quedaban mudos hasta el siguiente cambio — con una cancion larga, minutos.
@@ -1477,8 +1683,15 @@ io.on('connection', socket => {
   });
 
   // Avance automático desde PlayerView — sin auth, el servidor valida que haya sesión activa
-  socket.on('player:auto-next', async (_, cb) => {
+  socket.on('player:auto-next', async (datos, cb) => {
     if (typeof cb !== 'function') return;
+    // El avance automatico SOLO lo pide quien tiene el mando. Con dos paneles
+    // abiertos, los dos lo piden en el mismo instante y se salta una cancion.
+    const actual = mandoVivo();
+    if (actual && actual.deviceId !== (datos && datos.deviceId)) {
+      slog('mando:rechazado', { ruta: 'player:auto-next' });
+      return cb({ song: null });
+    }
     slog('autoNext:recv');
     if (!db.getSessionActive() && !db.getAutoDJEnabled()) return cb({ song: null });
     try {

@@ -4,6 +4,18 @@ import { Music, SkipForward, Volume2, Play, Pause } from 'lucide-react';
 
 const socket = io({ transports: ['websocket'] });
 
+// Identidad del dispositivo, compartida con el panel (misma clave). Esta vista
+// TAMBIEN reproduce, asi que tiene que participar en el mando: si no, el
+// servidor le rechazaria los avances cuando el mando lo tuviese otro panel.
+const deviceId = (() => {
+  let id = localStorage.getItem('jv_device');
+  if (!id) {
+    id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+    localStorage.setItem('jv_device', id);
+  }
+  return id;
+})();
+
 const CROSSFADE_MS      = 4000;   // duración por defecto — configurable desde RemoteView
 const CROSSFADE_TICK    = 50;
 const SILENCE_THRESHOLD = 0.02;   // valor por defecto — puede sobreescribirse desde RemoteView
@@ -38,6 +50,7 @@ export default function PlayerView() {
   const [duration, setDuration]       = useState(0);
   const [isPlaying, setIsPlaying]     = useState(false);
   const [needsTap, setNeedsTap]       = useState(false);
+  const [mandoPerdido, setMandoPerdido] = useState(null);
 
   const audioA = useRef(null);
   const audioB = useRef(null);
@@ -68,6 +81,31 @@ export default function PlayerView() {
     mixStartRef.current = nowPlaying?.mixStartMs ? nowPlaying.mixStartMs / 1000 : null;
     if (nowPlaying?.overlapSec > 0) crossfadeMsRef.current = nowPlaying.overlapSec * 1000;
   }, [nowPlaying]);
+
+  // ── El mando ───────────────────────────────────────────────────────────────
+  // Esta pantalla es un reproductor dedicado: quien la abre quiere que suene
+  // aqui, asi que toma el mando directamente en vez de preguntar.
+  useEffect(() => {
+    const nombre = 'Reproductor (/player)';
+    socket.emit('control:tomar', { deviceId, nombre });
+    const lat = setInterval(() => socket.emit('control:latido', { deviceId }), 10000);
+    const alSalir = () => socket.emit('control:soltar', { deviceId });
+    window.addEventListener('beforeunload', alSalir);
+    const alConectar = () => socket.emit('control:tomar', { deviceId, nombre });
+    socket.on('connect', alConectar);
+    const alRevocar = ({ porQuien }) => {
+      setMandoPerdido(porQuien || 'otro dispositivo');
+      [audioA.current, audioB.current].forEach(a => { if (a) { try { a.pause(); a.src = ''; } catch (e) {} } });
+      setIsPlaying(false);
+    };
+    socket.on('control:revocado', alRevocar);
+    return () => {
+      clearInterval(lat);
+      window.removeEventListener('beforeunload', alSalir);
+      socket.off('connect', alConectar);
+      socket.off('control:revocado', alRevocar);
+    };
+  }, []);
 
   const getActive   = () => activeRef.current === 'A' ? audioA.current : audioB.current;
   const getInactive = () => activeRef.current === 'A' ? audioB.current : audioA.current;
@@ -437,7 +475,7 @@ export default function PlayerView() {
         });
     } else {
       // Fin natural: socket acknowledgment sin necesidad de auth
-      socket.emit('player:auto-next', {}, (data) => {
+      socket.emit('player:auto-next', { deviceId }, (data) => {
         onSong(data?.song ?? null);
       });
     }
@@ -629,7 +667,7 @@ export default function PlayerView() {
     const dur = e.target.duration || 0;
     setCurrentTime(pos);
     setDuration(dur);
-    socket.emit('player:progress', { position: pos, duration: dur });
+    socket.emit('player:progress', { position: pos, duration: dur, deviceId });
 
     // PV-001: mantener posición de Media Session actualizada
     if ('mediaSession' in navigator && dur > 0) {
@@ -735,6 +773,22 @@ export default function PlayerView() {
           style={{ backgroundImage: coverBg, backgroundSize: 'cover', backgroundPosition: 'center' }} />
       )}
       <div className="absolute inset-0 bg-gradient-to-b from-[#07070f]/40 via-transparent to-[#07070f]" />
+
+      {mandoPerdido && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/85 px-6">
+          <div className="text-center max-w-sm">
+            <p className="text-xl font-extrabold text-white mb-2">Se ha tomado el control</p>
+            <p className="text-sm text-gray-400 leading-relaxed">
+              La reproducción ha pasado a <span className="text-gray-200 font-semibold">{mandoPerdido}</span>.
+              Este reproductor se ha detenido.
+            </p>
+            <button onClick={() => window.location.reload()}
+              className="mt-6 px-5 py-2.5 rounded-xl bg-red-700 hover:bg-red-600 text-white text-sm font-bold">
+              Recuperar el control
+            </button>
+          </div>
+        </div>
+      )}
 
       {needsTap && nowPlaying && !isPlaying && (
         <div

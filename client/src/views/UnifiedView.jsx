@@ -4,6 +4,32 @@ import { Search, ThumbsUp, Music, X, Play, Pause, SkipForward, Plus, ChevronDown
 
 const socket = io({ transports: ['websocket'] });
 
+// ── Identidad de este dispositivo ───────────────────────────────────────────
+// El servidor necesita distinguir dispositivos, no usuarios: el admin es la
+// misma cuenta en el ordenador y en el movil, y lo que no puede haber es dos
+// REPRODUCTORES a la vez. Se guarda en localStorage para que sobreviva a las
+// recargas (si cambiase en cada carga, recargar el panel perderia el mando).
+const deviceId = (() => {
+  let id = localStorage.getItem('jv_device');
+  if (!id) {
+    id = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random());
+    localStorage.setItem('jv_device', id);
+  }
+  return id;
+})();
+
+// Nombre legible para que el DJ sepa qué dispositivo tiene el mando.
+const nombreDispositivo = (() => {
+  const ua = navigator.userAgent;
+  const nav = /Edg\//.test(ua) ? 'Edge' : /OPR\//.test(ua) ? 'Opera'
+            : /Chrome\//.test(ua) ? 'Chrome' : /Firefox\//.test(ua) ? 'Firefox'
+            : /Safari\//.test(ua) ? 'Safari' : 'Navegador';
+  const so  = /iPhone|iPad/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android'
+            : /Windows/.test(ua) ? 'Windows' : /Mac OS/.test(ua) ? 'Mac'
+            : /Linux/.test(ua) ? 'Linux' : '';
+  return so ? nav + ' en ' + so : nav;
+})();
+
 // Manda un evento de diagnostico al log de la sesion (visible en el panel y en
 // /api/admin/log). El panel solo escribia en la consola del navegador, asi que
 // lo que oye la SALA era invisible desde el servidor: los fallos del crossfade
@@ -190,13 +216,17 @@ function AdminDashboard({
   currentUser, authToken, authFetch, queue,
   sessionActive, sessionName: initName, sessionDesc: initDesc,
   autoDJEnabled, autoDJActive, chatEnabled, nowPlaying,
-  sessionEndTime, onClose, onStopAudio, initialTab
+  sessionEndTime, inactividadMin, onClose, onStopAudio, initialTab
 }) {
   const [tab, setTab] = useState(initialTab || 'control');
 
   // Control tab
   const [volume,           setVolume]          = useState(100);
   const [clearChatConfirm, setClearChatConfirm] = useState(false);
+  const [inactMin,   setInactMin]   = useState(inactividadMin ?? 120);
+  const [inactSaved, setInactSaved] = useState(false);
+  const [limpiaEntrar, setLimpiaEntrar] = useState(
+    () => localStorage.getItem('jv_limpiar_al_entrar') !== '0');
   const [playlists,        setPlaylists]        = useState([]);
   const [selectedPLs,      setSelectedPLs]      = useState([]);
   const [plsSaving,        setPlsSaving]        = useState(false);
@@ -489,6 +519,38 @@ function AdminDashboard({
             </div>
           </div>
 
+          {/* Cierre por inactividad — distinto de la duración fija: aquella corta
+              a una hora concreta, esta cierra lo que se ha quedado olvidado. */}
+          <div className="bg-gray-900/50 rounded-2xl border border-gray-800/40 p-4 space-y-3">
+            <p className="text-xs text-gray-500 font-semibold uppercase tracking-widest">Cierre por inactividad</p>
+            <p className="text-[11px] text-gray-600 leading-snug">
+              Si nadie interactúa (añadir, votar, chat, tocar el panel) durante este tiempo, la
+              fiesta se cierra sola. Que el panel esté reproduciendo también cuenta como
+              actividad, así que una fiesta con el altavoz puesto no se corta.
+            </p>
+            <div className="flex items-center gap-3">
+              <select value={inactMin} onChange={e => setInactMin(Number(e.target.value))}
+                className="flex-1 bg-gray-800 border border-gray-700/60 rounded-xl px-3 py-2.5 text-sm text-white focus:outline-none focus:border-red-600/60">
+                {[0,30,60,90,120,180,240,360].map(m =>
+                  <option key={m} value={m}>{m === 0 ? 'Desactivado' : m + ' min'}</option>)}
+              </select>
+              <button onClick={async () => {
+                  await authFetch('/api/session/inactividad', { method: 'POST', body: JSON.stringify({ minutos: inactMin }) });
+                  setInactSaved(true); setTimeout(() => setInactSaved(false), 2000);
+                }}
+                className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 text-gray-200 rounded-xl text-sm font-semibold">
+                {inactSaved ? '¡Guardado!' : 'Guardar'}
+              </button>
+            </div>
+            <label className="flex items-center gap-3 pt-1 cursor-pointer">
+              <input type="checkbox" checked={limpiaEntrar}
+                onChange={e => { setLimpiaEntrar(e.target.checked);
+                                 localStorage.setItem('jv_limpiar_al_entrar', e.target.checked ? '1' : '0'); }}
+                className="w-4 h-4 accent-red-600" />
+              <span className="text-xs text-gray-400">Limpiar este dispositivo al entrar si no hay fiesta</span>
+            </label>
+          </div>
+
           {/* Mezcla entre canciones — sin mandos: la regla es fija y el servidor
               calcula por cancion donde arranca el solape. */}
           <div className="bg-gray-900/50 rounded-2xl border border-gray-800/40 p-4 space-y-3">
@@ -630,7 +692,7 @@ function AdminDashboard({
                 </div>
               </div>
               <p className="text-xs text-gray-600">
-                {durHours === 0 && durMins === 0 ? 'Sin límite — la sesión no se cerrará sola' : `La sesión se cerrará automáticamente en ${durHours ? durHours + 'h ' : ''}${durMins ? durMins + 'm' : ''}`}
+                {durHours === 0 && durMins === 0 ? 'Sin límite — la sesión no se cerrará a una hora fija' : `La sesión se cerrará automáticamente en ${durHours ? durHours + 'h ' : ''}${durMins ? durMins + 'm' : ''}`}
               </p>
             </div>
           )}
@@ -864,9 +926,52 @@ export default function UnifiedView() {
     return () => { clearTimeout(to); ac.abort(); };
   }, []);
 
+  // Al entrar un admin y NO haber fiesta abierta, se arranca en limpio por si
+  // quedó estado de la vez anterior.
+  //
+  // ⚠️ Dos cosas que hay que hacer bien o se rompe:
+  //  1. NO tocar `jv_auth`: borrarlo cerraría la sesión en el mismo instante de
+  //     entrar, dejando al DJ tecleando la contraseña otra vez.
+  //  2. Evitar el bucle: tras limpiar hay que recargar, y al recargar se sigue
+  //     siendo admin y sigue sin haber fiesta. La marca en `sessionStorage`
+  //     (que muere con la pestaña, así que un login nuevo de verdad sí vuelve a
+  //     limpiar) más el backoff de `jv_last_reload` lo cortan.
+  const limpiarAlEntrar = async () => {
+    if (localStorage.getItem('jv_limpiar_al_entrar') === '0') return;
+    if (sessionStorage.getItem('jv_ya_limpiado')) return;
+    const ultima = Number(localStorage.getItem('jv_last_reload') || 0);
+    if (Date.now() - ultima < 90000) return;
+    try {
+      const r = await fetch('/api/session/status');
+      const st = await r.json();
+      if (st && st.active) return;                 // hay fiesta: no se toca nada
+    } catch (e) { return; }
+    sessionStorage.setItem('jv_ya_limpiado', '1');
+    // Se conservan el token (si no, login otra vez) y la identidad del
+    // dispositivo (si cambiase, este panel perdería el mando que ya tiene).
+    const conservar = {
+      jv_auth: localStorage.getItem('jv_auth'),
+      jv_device: localStorage.getItem('jv_device'),
+      jv_limpiar_al_entrar: localStorage.getItem('jv_limpiar_al_entrar'),
+    };
+    try {
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map(k => caches.delete(k)));
+      }
+    } catch (e) {}
+    try {
+      localStorage.clear();
+      for (const [k, v] of Object.entries(conservar)) if (v != null) localStorage.setItem(k, v);
+      localStorage.setItem('jv_last_reload', String(Date.now()));
+    } catch (e) {}
+    window.location.reload();
+  };
+
   const handleAuth = (token, user) => {
     localStorage.setItem('jv_auth', token);
     setAuthToken(token); setCurrentUser(user);
+    if (user?.role === 'admin') limpiarAlEntrar();
   };
   const logout = () => {
     localStorage.removeItem('jv_auth');
@@ -876,9 +981,12 @@ export default function UnifiedView() {
   };
   const isAdmin = currentUser?.role === 'admin';
 
+  // El servidor rechaza (409) las ordenes de reproduccion de quien no tiene el
+  // mando, y para eso necesita saber DESDE QUE DISPOSITIVO llega la peticion.
   const authFetch = (url, opts = {}) => fetch(url, {
     ...opts,
-    headers: { 'Content-Type': 'application/json', ...opts.headers, Authorization: 'Bearer ' + authToken }
+    headers: { 'Content-Type': 'application/json', ...opts.headers,
+               'X-Device-Id': deviceId, Authorization: 'Bearer ' + authToken }
   });
 
   // ── dual audio + crossfade ─────────────────────────────────────────────────
@@ -980,6 +1088,14 @@ export default function UnifiedView() {
   const [sessionName, setSessionName]         = useState('');
   const [sessionDesc, setSessionDesc]         = useState('');
   const [sessionEndTime, setSessionEndTime]   = useState(null);
+  // Cierre por inactividad: cuándo caducaría y el aviso de los últimos minutos.
+  const [inactivoHasta,  setInactivoHasta]    = useState(null);
+  const [inactividadMin, setInactividadMin]   = useState(120);
+  const [avisoCierre,    setAvisoCierre]      = useState(null);   // minutos que quedan
+  // El mando: quién reproduce. `null` = libre; si lo tiene otro, sale el aviso.
+  const [mandoOcupado,   setMandoOcupado]     = useState(null);   // { nombre, desde }
+  const [tengoMando,     setTengoMando]       = useState(false);
+  const [revocado,       setRevocado]         = useState(null);   // quién me lo quitó
   const [voterListening, setVoterListening] = useState(false);
   const [voterLoading,   setVoterLoading]   = useState(false);
   const [voterNeedsTap,  setVoterNeedsTap]  = useState(false);  // play() bloqueado por el navegador
@@ -1144,7 +1260,25 @@ export default function UnifiedView() {
     });
     socket.on('chat:toggle', ({ enabled }) => setChatEnabled(enabled));
     socket.on('chat:clear',  () => setChatMessages([]));
-    socket.on('session:timer', ({ endsAt }) => setSessionEndTime(endsAt || null));
+    socket.on('session:timer', ({ endsAt, inactivoHasta, inactividadMin }) => {
+      setSessionEndTime(endsAt || null);
+      if (inactivoHasta !== undefined) setInactivoHasta(inactivoHasta || null);
+      if (inactividadMin !== undefined) setInactividadMin(inactividadMin);
+    });
+    socket.on('session:aviso', ({ minutos }) => setAvisoCierre(minutos || null));
+    // ── El mando ─────────────────────────────────────────────────────────────
+    socket.on('control:estado', ({ ocupado, nombre, desde }) => {
+      setMandoOcupado(ocupado ? { nombre, desde } : null);
+      if (!ocupado) setTengoMando(false);
+    });
+    // Otro dispositivo ha tomado el control: se cierra la sesión aquí, como se
+    // decidió. Parar el audio ANTES de nada, o la sala se queda con dos fuentes.
+    socket.on('control:revocado', ({ porQuien }) => {
+      setTengoMando(false);
+      try { stopAudio(); } catch (e) {}
+      setRevocado(porQuien || 'otro dispositivo');
+      localStorage.removeItem('jv_auth');
+    });
     // Remote control: admin audio responds to player:cmd from RemoteView
     if (currentUser?.role === 'admin') {
       socket.on('player:cmd', ({ action, value }) => {
@@ -1187,6 +1321,7 @@ export default function UnifiedView() {
       socket.off('session:update'); socket.off('autodj:update'); socket.off('users:online');
       window.removeEventListener('error', onError);
       window.removeEventListener('unhandledrejection', onError);
+      socket.off('session:aviso'); socket.off('control:estado'); socket.off('control:revocado');
       socket.off('player:silence-config'); socket.off('player:crossfade-config');
       socket.off('player:cmd'); socket.off('spooty:ready'); socket.off('spooty:error');
       socket.off('connect', onConnect); socket.off('disconnect'); socket.off('heartbeat'); socket.off('chat:history'); socket.off('chat:message');
@@ -1244,6 +1379,66 @@ export default function UnifiedView() {
     const id = setInterval(tick, 12000);
     return () => clearInterval(id);
   }, [currentUser]);
+
+  // ── El mando ───────────────────────────────────────────────────────────────
+  // Solo el panel de un admin reproduce, así que solo él lo pide. `pedir` nunca
+  // arrebata: si está ocupado devuelve por quién y se le pregunta al DJ.
+  const pedirMando = () => new Promise(res => {
+    socket.emit('control:pedir', { deviceId, nombre: nombreDispositivo, username: currentUser?.username }, (r) => {
+      if (r && r.ok) { setTengoMando(true); setMandoOcupado(null); }
+      else if (r && r.ocupado) { setTengoMando(false); setMandoOcupado(r.ocupado); }
+      res(r);
+    });
+  });
+
+  const tomarMando = () => {
+    socket.emit('control:tomar', { deviceId, nombre: nombreDispositivo, username: currentUser?.username }, (r) => {
+      if (r && r.ok) { setTengoMando(true); setMandoOcupado(null); }
+    });
+  };
+
+  useEffect(() => {
+    if (!isAdmin || revocado) return;
+    pedirMando();
+    // Latido: sin él, el servidor libera el mando a los 30 s. Es lo que evita
+    // quedarse bloqueado fuera si este dispositivo se apaga de golpe.
+    const lat = setInterval(() => socket.emit('control:latido', { deviceId }), 10000);
+    const alSalir = () => socket.emit('control:soltar', { deviceId });
+    window.addEventListener('beforeunload', alSalir);
+    // Al reconectar (típico en móvil) hay que volver a pedirlo: el servidor
+    // pudo haberlo liberado por falta de latido mientras no había conexión.
+    const alConectar = () => pedirMando();
+    socket.on('connect', alConectar);
+    return () => {
+      clearInterval(lat);
+      window.removeEventListener('beforeunload', alSalir);
+      socket.off('connect', alConectar);
+    };
+  }, [isAdmin, currentUser?.username, revocado]);
+
+  // Cuenta atrás para la cabecera: se pinta el vencimiento más cercano de los
+  // dos criterios y se dice cuál es, porque no es lo mismo "acaba a las 2:00"
+  // que "se cierra por inactividad" (esto último lo evita cualquier interacción).
+  const [cuentaAtras, setCuentaAtras] = useState(null);
+  useEffect(() => {
+    const tick = () => {
+      const cands = [];
+      if (sessionEndTime)  cands.push({ t: sessionEndTime,  motivo: 'La fiesta acaba a la hora programada' });
+      if (inactivoHasta)   cands.push({ t: inactivoHasta,   motivo: 'Se cerrará por inactividad si nadie interactúa' });
+      if (!cands.length) { setCuentaAtras(null); return; }
+      const p = cands.sort((a, b) => a.t - b.t)[0];
+      const rem = Math.max(0, p.t - Date.now());
+      const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
+      setCuentaAtras({
+        texto: h > 0 ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m + 'm',
+        motivo: p.motivo,
+        urgente: rem <= 15 * 60000,
+      });
+    };
+    tick();
+    const id = setInterval(tick, 30000);
+    return () => clearInterval(id);
+  }, [sessionEndTime, inactivoHasta]);
 
   useEffect(() => { voterListeningRef.current = voterListening; }, [voterListening]);
   useEffect(() => { chatOpenRef.current = chatOpen; if (chatOpen) setChatUnread(0); }, [chatOpen]);
@@ -1546,8 +1741,11 @@ export default function UnifiedView() {
   const triggerCrossfade = (nextQueue) => {
     if (!nextQueue || nextQueue.length === 0) { fadeScheduled.current = false; return; }
     startCrossfade(nextQueue[0]);
-    // Avanzar cola en servidor (fire-and-forget)
-    authFetch('/api/player/next', { method: 'POST' }).catch(() => {});
+    // Avanzar cola en servidor (fire-and-forget). `porMezcla` distingue este
+    // avance AUTOMATICO de un skip a mano: el servidor solo acepta el
+    // automatico del dispositivo que tiene el mando, para que una pestaña
+    // olvidada no avance la cola por su cuenta.
+    authFetch('/api/player/next', { method: 'POST', body: JSON.stringify({ porMezcla: true }) }).catch(() => {});
   };
 
   // ── audio event handlers ───────────────────────────────────────────────────
@@ -1565,7 +1763,7 @@ export default function UnifiedView() {
     const dur = audio.duration || 0;
     setCurrentTime(ct);
     setDuration(dur);
-    socket.emit('player:progress', { position: ct, duration: dur });
+    socket.emit('player:progress', { position: ct, duration: dur, deviceId });
     // Punto de entrada de la siguiente cancion, ya calculado por el servidor segun
     // como acabe esta (final seco, silencio de cola o fundido). Aqui solo hay que
     // arrancar el solapamiento justo ahi. Sin ese dato (analisis aun en curso), se
@@ -1586,7 +1784,7 @@ export default function UnifiedView() {
         triggerCrossfade(queue);
       } else if (autoDJEnabled) {
         // AutoDJ: pedir la siguiente canción al servidor y arrancar crossfade
-        authFetch('/api/player/next', { method: 'POST' })
+        authFetch('/api/player/next', { method: 'POST', body: JSON.stringify({ porMezcla: true }) })
           .then(r => r.json())
           .then(({ song }) => { if (song) startCrossfade(song); else fadeScheduled.current = false; })
           .catch(() => { fadeScheduled.current = false; });
@@ -1873,6 +2071,27 @@ export default function UnifiedView() {
       <div className="w-8 h-8 border-2 border-red-700 border-t-transparent rounded-full animate-spin" />
     </div>
   );
+  // Otro dispositivo ha tomado el control. Se cierra la sesión aquí para que no
+  // queden dos paneles peleándose por dirigir la reproducción.
+  if (revocado) return (
+    <div className="min-h-[100dvh] flex flex-col items-center justify-center fade-in px-6"
+      style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat" }}>
+      <div className="w-14 h-14 rounded-2xl bg-yellow-900/30 border border-yellow-700/40 flex items-center justify-center mb-6">
+        <Power size={26} className="text-yellow-500" />
+      </div>
+      <h1 className="text-2xl font-extrabold text-white mb-2 text-center">Se ha tomado el control</h1>
+      <p className="text-gray-400 text-sm text-center max-w-xs leading-relaxed">
+        La reproducción ha pasado a <span className="text-gray-200 font-semibold">{revocado}</span>.
+        Este dispositivo ha dejado de sonar.
+      </p>
+      <button onClick={() => { setRevocado(null); window.location.reload(); }}
+        className="mt-8 px-6 py-3 rounded-xl text-white text-sm font-bold"
+        style={{ background: 'linear-gradient(135deg,#dc2626,#991b1b)' }}>
+        Volver a entrar
+      </button>
+    </div>
+  );
+
   if (!currentUser) return <AuthModal onAuth={handleAuth} />;
 
   // Non-admin waiting screen when session is closed
@@ -1890,8 +2109,8 @@ export default function UnifiedView() {
       <div className="flex items-center gap-3 bg-gray-900/60 border border-gray-800/50 rounded-2xl px-6 py-4 mt-8">
         <div className="w-2.5 h-2.5 rounded-full bg-yellow-600/70 animate-pulse flex-shrink-0" />
         <div>
-          <p className="text-gray-300 text-sm font-semibold">Sesion no iniciada</p>
-          <p className="text-gray-600 text-xs mt-0.5">El DJ abrira la sesion en breve...</p>
+          <p className="text-gray-300 text-sm font-semibold">No hay ninguna fiesta en marcha</p>
+          <p className="text-gray-600 text-xs mt-0.5">Tiene que abrirla un administrador.</p>
         </div>
       </div>
       <button onClick={logout} className="mt-10 text-xs text-gray-700 hover:text-gray-500 transition-colors flex items-center gap-1.5">
@@ -1903,6 +2122,67 @@ export default function UnifiedView() {
   return (
     <div className="min-h-[100dvh] text-white flex flex-col max-w-2xl mx-auto px-4"
       style={{ background: "linear-gradient(rgba(13,6,8,0.93),rgba(13,6,8,0.96)), url('/dj_falla.png') center/cover no-repeat", paddingBottom: 'max(2.5rem, env(safe-area-inset-bottom))' }}>
+
+      {/* ── El mando lo tiene otro dispositivo ──────────────────────────────
+          Se ofrece traspasarlo, y también la alternativa de no pelearse por él:
+          /remote manda (volumen, saltar) sin reproducir, que es lo que suele
+          querer quien coge el móvil teniendo el ordenador puesto. */}
+      {isAdmin && mandoOcupado && !tengoMando && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center px-5 bg-black/80">
+          <div className="bg-gray-900 border border-yellow-800/50 rounded-2xl p-5 w-full max-w-sm shadow-2xl">
+            <p className="text-base font-bold text-white mb-1.5">Ya hay un dispositivo reproduciendo</p>
+            <p className="text-sm text-gray-400 leading-relaxed">
+              <span className="text-gray-200 font-semibold">{mandoOcupado.nombre}</span>
+              {mandoOcupado.desde && <> · desde hace {Math.max(1, Math.round((Date.now() - mandoOcupado.desde) / 60000))} min</>}
+            </p>
+            <p className="text-xs text-gray-600 mt-3 leading-relaxed">
+              Si tomas el control, ese dispositivo dejará de sonar y se le cerrará la sesión.
+            </p>
+            <div className="flex flex-col gap-2 mt-5">
+              <button onClick={tomarMando}
+                className="w-full py-3 rounded-xl text-white text-sm font-bold"
+                style={{ background: 'linear-gradient(135deg,#dc2626,#991b1b)' }}>
+                Tomar el control
+              </button>
+              <button onClick={() => window.location.href = '/remote'}
+                className="w-full py-2.5 rounded-xl bg-gray-800 hover:bg-gray-700 text-gray-300 text-sm font-semibold">
+                Usar como mando a distancia
+              </button>
+              <button onClick={logout} className="w-full py-2 text-xs text-gray-600 hover:text-gray-400">
+                Salir
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Aún no hay fiesta: al admin hay que decírselo y darle el botón */}
+      {isAdmin && !sessionActive && (
+        <button onClick={() => { setAdminTab('sesion'); setAdminOpen(true); }}
+          className="mt-3 w-full rounded-2xl border border-yellow-800/50 bg-yellow-950/30 px-4 py-3 flex items-center gap-3 text-left active:scale-[0.99] transition-transform">
+          <div className="w-2.5 h-2.5 rounded-full bg-yellow-600 animate-pulse flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-yellow-200">No hay ninguna fiesta en marcha</p>
+            <p className="text-xs text-yellow-700/90 mt-0.5">Toca aquí para abrirla</p>
+          </div>
+          <Power size={16} className="text-yellow-600 flex-shrink-0" />
+        </button>
+      )}
+
+      {/* La fiesta va a cerrarse por inactividad */}
+      {isAdmin && sessionActive && avisoCierre && (
+        <div className="mt-3 w-full rounded-2xl border border-orange-800/50 bg-orange-950/30 px-4 py-3 flex items-center gap-3">
+          <Clock size={16} className="text-orange-500 flex-shrink-0" />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-orange-200">La fiesta se cerrará en {avisoCierre} min</p>
+            <p className="text-xs text-orange-700/90 mt-0.5">Nadie ha interactuado en un buen rato</p>
+          </div>
+          <button onClick={() => authFetch('/api/session/sigo', { method: 'POST' }).catch(() => {})}
+            className="px-3 py-2 rounded-xl bg-orange-900/60 hover:bg-orange-800/60 text-orange-100 text-xs font-bold flex-shrink-0">
+            Seguimos aquí
+          </button>
+        </div>
+      )}
 
       {/* Online users panel */}
       {showOnlinePanel && isAdmin && (
@@ -1973,7 +2253,7 @@ export default function UnifiedView() {
           currentUser={currentUser} authToken={authToken} authFetch={authFetch}
           queue={queue} sessionActive={sessionActive} sessionName={sessionName} sessionDesc={sessionDesc}
           autoDJEnabled={autoDJEnabled} autoDJActive={autoDJActive} chatEnabled={chatEnabled}
-          nowPlaying={nowPlaying} sessionEndTime={sessionEndTime}
+          nowPlaying={nowPlaying} sessionEndTime={sessionEndTime} inactividadMin={inactividadMin}
           onClose={() => setAdminOpen(false)} onStopAudio={stopAudio}
           initialTab={adminTab}
         />
@@ -2009,6 +2289,16 @@ export default function UnifiedView() {
             <span className="text-xs text-gray-500">{currentUser.username}</span>
             {isAdmin && <span className="text-[10px] bg-yellow-900/50 text-yellow-500 px-1.5 py-0.5 rounded font-semibold">ADMIN</span>}
           </div>
+          {/* Cuenta atrás de la fiesta: el vencimiento MÁS CERCANO de los dos
+              (hora fija de fin e inactividad), con el motivo. Antes vivía solo
+              dentro del panel, donde no se ve mientras pinchas. */}
+          {sessionActive && cuentaAtras && (
+            <span className={'text-xs font-mono px-2 py-0.5 rounded-lg ' +
+              (cuentaAtras.urgente ? 'bg-orange-950/50 text-orange-400' : 'bg-gray-900/60 text-gray-500')}
+              title={cuentaAtras.motivo}>
+              {cuentaAtras.texto}
+            </span>
+          )}
           {isAdmin && (
             <button onClick={() => setShowOnlinePanel(p => !p)}
               className="flex items-center gap-1 text-gray-500 hover:text-gray-300 transition-colors" title="Usuarios online">

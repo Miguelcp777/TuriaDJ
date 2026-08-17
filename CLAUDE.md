@@ -280,6 +280,60 @@ Y en `onVisibility`, si `getActive()?.paused === false` (está "playing" según 
 
 ---
 
+## El mando: un solo reproductor a la vez (✅ 2026-08-16)
+
+**"Sesión" significa dos cosas** en este proyecto: el login de un usuario y el evento musical.
+En la interfaz el evento se llama ahora **"fiesta"**; en el código, `session_active`.
+
+El **mando** es una tercera cosa, y es la que importa para el audio: **qué dispositivo
+reproduce y dirige**. Cualquier admin puede estar identificado a la vez, pero solo uno tiene el
+mando. Hizo falta porque el panel es quien dirige la reproducción: con dos paneles abiertos, los
+dos piden el avance en el mismo instante (se salta una canción) y los dos escriben la posición.
+
+| Pieza | Detalle |
+|---|---|
+| Identidad | `deviceId` en `localStorage` (`jv_device`), compartido por `UnifiedView` y `PlayerView` |
+| Estado | `mando = { deviceId, nombre, username, socketId, desde, latido }` en `server.js` |
+| Protocolo | `control:pedir` (no arrebata) · `control:tomar` (arrebata) · `control:latido` (10 s) · `control:soltar` · `control:revocado` |
+| Caducidad | `MANDO_TTL_MS` 30 s sin latido → queda libre |
+| Refuerzo | `soloMando` en `/api/session/*`; en `/api/player/next` solo si `porMezcla`; sockets `player:progress` y `player:auto-next` comparan `deviceId` |
+
+⚠️ **El mando NO se limpia en `resetRuntimeState()`.** Se probó y estaba mal: esa función corre
+al **iniciar** la fiesta, justo después de que el DJ cogiera el mando al abrir el panel, así que
+le dejaba sin control y otro dispositivo podía cogerlo sin que saltara ningún aviso. El mando va
+con el dispositivo, no con la fiesta.
+
+⚠️ **Un skip a mano lo puede pedir cualquier admin**, también `RemoteView` — es un mando a
+distancia legítimo que no reproduce. Lo que se rechaza de otro dispositivo es el avance
+**automático** de una mezcla (`porMezcla: true`), que es donde una pestaña olvidada hace daño.
+
+⚠️ **Al desconectarse un socket NO se libera el mando**: en el móvil el socket se cae al
+bloquear la pantalla. Se deja caducar por latido.
+
+## Cierre de la fiesta: dos criterios (✅ 2026-08-16)
+
+Se cierra por el que llegue antes:
+
+1. **Duración fija** (la de siempre): `session_end_time`, opcional, se elige al iniciar.
+2. **Inactividad**: `session_inactividad_min` (por defecto **120**, `0` = desactivado).
+
+Motivo: una sesión abierta a las 12:07 siguió sonando **6,5 h y 97 canciones** sin que nadie la
+escuchara — **96 de los 97 avances los pidió el temporizador de seguridad**, solo 1 el panel.
+
+**Qué cuenta como actividad** (`marcarActividad`):
+- acciones humanas: añadir, votar, chat, `user:join`, rutas de admin;
+- **un mando vivo reproduciendo** (`player:progress` del dispositivo al mando).
+
+⚠️ **NO cuenta que AutoDJ avance canciones.** Si contase, la sesión olvidada no caducaría nunca.
+
+⚠️ **SÍ cuenta el mando reproduciendo**, y es imprescindible: el caso más común es el admin que
+engancha el altavoz y la gente baila sin tocar el móvil — cero interacciones durante horas con
+la fiesta muy viva. Verificado con las dos caras en la misma pasada: con el panel reproduciendo
+**no se cierra**; en cuanto el panel se va, **se cierra**.
+
+Aviso al admin cuando quedan `AVISO_MIN` (15) minutos, con **[Seguimos aquí]**
+(`POST /api/session/sigo`). La comprobación corre cada 20 s.
+
 ## Gotchas conocidos
 
 - **`autoDJActive`** es variable global en `server.js` — sincronizarla con DB al reiniciar servidor si se quiere persistir estado entre reinicios
@@ -529,6 +583,7 @@ También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.
 | Fecha | Cambio |
 |-------|--------|
 | 2026-08-15 | **Sin panel conectado, la emisión y la app se separaban** — el puente movía el audio pero `nowPlaying` esperaba a la red de seguridad (`duración + 2`); el desfase se acumulaba (medido en producción: 0 → 35 → 40 → 64 s) y acababa preparando la mezcla hacia una canción ya sonada: corte antes de tiempo y repeticiones. Descubierto al ver que en una sesión de 6,5 h **96 de 97 avances los pidió el temporizador de seguridad**, no el panel. A/B con AutoDJ y cero navegadores: **33,4 s → 0,0 s**. |
+| 2026-08-16 | **Un solo dispositivo al mando + cierre por inactividad** — cualquier número de admins podía reproducir a la vez (dos paneles = dos avances simultáneos = canción saltada) y una fiesta podía quedarse abierta indefinidamente. Nuevo concepto de **mando** con traspaso explícito, caducidad por latido de 30 s y rechazo en servidor de las órdenes de quien no lo tiene. Cierre por inactividad (120 min por defecto) que **distingue una fiesta con el altavoz puesto de una sesión olvidada**. ⚠️ Dos hallazgos al probar: `resetRuntimeState()` borraba el mando justo al iniciar la fiesta, y el avance automático de la mezcla hay que distinguirlo del skip a mano o se rompe `RemoteView`. |
 | 2026-08-15 | **Crossfade del panel arreglado de raíz** — dos fallos: (a) el bucle del fundido moría en su primer fotograma por un `IndexSizeError` al asignar un volumen > 1 (`rAF` entrega la marca del fotograma, que puede ser anterior a `t0` → `p` negativo); (b) el panel **no precargaba** la siguiente canción y la cargaba en el instante de la mezcla, 3 s antes del final. Verificado en Chromium con red estrangulada sobre transiciones reales, 4 casos (entrante normal, con 7,9 s de silencio inicial, con 1 s, y AutoDJ): **2,8 s de solape real y 0,00 s de silencio en los cuatro**. ⚠️ El primero solo se encontró **capturando `pageerror` de la página** en el test. |
 | 2026-08-11 | **Silencio inicial recortado en TODO arranque** — el recorte solo se aplicaba dentro de una transición, así que la primera canción de la sesión, un skip del DJ o una recarga del panel emitían el silencio entero. Censo: **44% de la biblioteca empieza con algo de silencio, 13% con 1 s o más**. A/B sobre "Fantasy Girl" arrancando en seco: **17 ventanas mudas de 0,5 s → 0**. |
 | 2026-08-11 | **Regla de mezcla única: solapar 3 s, sin mandos** — se quitan los dos sliders de silencio (y el de duración del crossfade, que la contradecía). El servidor calcula por canción dónde entra la siguiente según su final (seco / silencio de cola / fundido) y lo manda como `mixStartMs`; sala, `/player` y móviles usan el mismo punto. ⚠️ Dos hallazgos: `astats` imprime **por frame**, no por ventana (había que agrupar con `asetnsamples`), y **7 de cada 20 canciones empiezan con silencio** (la peor 7,9 s) — sin recortarlo el solape terminaba en −93,5 dB. Verificado sobre **60 canciones** de la biblioteca real (17 secas, 16 con cola muda, 27 con fundido): el solape cae siempre sobre música. |
