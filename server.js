@@ -1475,6 +1475,7 @@ function emitirTiempos(endsAtMs) {
     endsAt: endsAtMs !== undefined ? endsAtMs : (guardado ? parseInt(guardado) : null),
     inactivoHasta: finPorInactividad(),
     inactividadMin: inactividadMin(),
+    iniciadaEn: db.getSessionActive() ? sessionStartTime : null,
   });
 }
 
@@ -1594,7 +1595,8 @@ io.on('connection', socket => {
   const storedEnd = db.getSetting('session_end_time');
   socket.emit('session:timer',  { endsAt: storedEnd ? parseInt(storedEnd) : null,
                                   inactivoHasta: finPorInactividad(),
-                                  inactividadMin: inactividadMin() });
+                                  inactividadMin: inactividadMin(),
+                                  iniciadaEn: db.getSessionActive() ? sessionStartTime : null });
   // Send current online list to this socket
   const list = [...onlineUsers.values()];
   socket.emit('users:online', { count: list.length, users: list });

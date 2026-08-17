@@ -1090,6 +1090,7 @@ export default function UnifiedView() {
   const [sessionEndTime, setSessionEndTime]   = useState(null);
   // Cierre por inactividad: cuándo caducaría y el aviso de los últimos minutos.
   const [inactivoHasta,  setInactivoHasta]    = useState(null);
+  const [iniciadaEn,     setIniciadaEn]       = useState(null);
   const [inactividadMin, setInactividadMin]   = useState(120);
   const [avisoCierre,    setAvisoCierre]      = useState(null);   // minutos que quedan
   // El mando: quién reproduce. `null` = libre; si lo tiene otro, sale el aviso.
@@ -1260,10 +1261,11 @@ export default function UnifiedView() {
     });
     socket.on('chat:toggle', ({ enabled }) => setChatEnabled(enabled));
     socket.on('chat:clear',  () => setChatMessages([]));
-    socket.on('session:timer', ({ endsAt, inactivoHasta, inactividadMin }) => {
+    socket.on('session:timer', ({ endsAt, inactivoHasta, inactividadMin, iniciadaEn }) => {
       setSessionEndTime(endsAt || null);
       if (inactivoHasta !== undefined) setInactivoHasta(inactivoHasta || null);
       if (inactividadMin !== undefined) setInactividadMin(inactividadMin);
+      if (iniciadaEn !== undefined) setIniciadaEn(iniciadaEn || null);
     });
     socket.on('session:aviso', ({ minutos }) => setAvisoCierre(minutos || null));
     // ── El mando ─────────────────────────────────────────────────────────────
@@ -1419,26 +1421,38 @@ export default function UnifiedView() {
   // Cuenta atrás para la cabecera: se pinta el vencimiento más cercano de los
   // dos criterios y se dice cuál es, porque no es lo mismo "acaba a las 2:00"
   // que "se cierra por inactividad" (esto último lo evita cualquier interacción).
+  // Reloj de la cabecera. ⚠️ NO puede ser la cuenta atrás por inactividad a
+  // secas: mientras el panel reproduce, cada `player:progress` reinicia ese
+  // reloj varias veces por segundo, así que se queda clavado en el máximo
+  // (se veía siempre "1h 59m"). Un número que nunca baja no informa de nada.
+  //   · Con hora de fin programada → cuenta atrás hasta ella.
+  //   · Si va a cerrarse por inactividad de verdad (queda poco) → esa, en rojo.
+  //   · Si no → tiempo que lleva la fiesta, que siempre avanza.
   const [cuentaAtras, setCuentaAtras] = useState(null);
   useEffect(() => {
     const tick = () => {
-      const cands = [];
-      if (sessionEndTime)  cands.push({ t: sessionEndTime,  motivo: 'La fiesta acaba a la hora programada' });
-      if (inactivoHasta)   cands.push({ t: inactivoHasta,   motivo: 'Se cerrará por inactividad si nadie interactúa' });
-      if (!cands.length) { setCuentaAtras(null); return; }
-      const p = cands.sort((a, b) => a.t - b.t)[0];
-      const rem = Math.max(0, p.t - Date.now());
-      const h = Math.floor(rem / 3600000), m = Math.floor((rem % 3600000) / 60000);
-      setCuentaAtras({
-        texto: h > 0 ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m + 'm',
-        motivo: p.motivo,
-        urgente: rem <= 15 * 60000,
-      });
+      const ahora = Date.now();
+      const quedaInact = inactivoHasta ? inactivoHasta - ahora : null;
+      const fmt = ms => {
+        const h = Math.floor(ms / 3600000), m = Math.floor((ms % 3600000) / 60000);
+        return h > 0 ? h + 'h ' + String(m).padStart(2, '0') + 'm' : m + 'm';
+      };
+      if (quedaInact !== null && quedaInact <= 16 * 60000) {
+        setCuentaAtras({ texto: fmt(Math.max(0, quedaInact)), urgente: true,
+                         motivo: 'Se cerrará por inactividad si nadie interactúa' });
+      } else if (sessionEndTime) {
+        setCuentaAtras({ texto: fmt(Math.max(0, sessionEndTime - ahora)),
+                         urgente: sessionEndTime - ahora <= 15 * 60000,
+                         motivo: 'Queda para el final programado de la fiesta' });
+      } else if (iniciadaEn) {
+        setCuentaAtras({ texto: fmt(ahora - iniciadaEn), urgente: false,
+                         motivo: 'Tiempo que lleva abierta la fiesta' });
+      } else setCuentaAtras(null);
     };
     tick();
-    const id = setInterval(tick, 30000);
+    const id = setInterval(tick, 20000);
     return () => clearInterval(id);
-  }, [sessionEndTime, inactivoHasta]);
+  }, [sessionEndTime, inactivoHasta, iniciadaEn]);
 
   useEffect(() => { voterListeningRef.current = voterListening; }, [voterListening]);
   useEffect(() => { chatOpenRef.current = chatOpen; if (chatOpen) setChatUnread(0); }, [chatOpen]);
