@@ -398,6 +398,31 @@ descarga tardaba más, la saliente se acababa y se oía el corte. Ahora
 `precargarSiguiente()` la baja **45 s antes** del punto de mezcla (cola o
 `player:peek-next` en AutoDJ) y `startCrossfade` no toca el `src` si ya está lista.
 
+### ⚠️ Sin panel conectado, el motor y la app se separaban (corregido 2026-08-15)
+
+`enterBridge` movía el **audio** a la canción siguiente en el punto de mezcla, pero
+`nowPlaying` no avanzaba hasta que saltaba la red de seguridad en `duración + 2`.
+Con un panel vivo no se notaba (el avance lo pide él), pero **sin ningún reproductor**
+el desfase se acumula canción a canción — medido en una sesión real: 0 s → 35 s →
+40 s → 64 s. Y como `nextUpId()`, la precarga y la verja anti-obsoletos se calculan
+desde la DB, al crecer el desfase el motor preparaba la mezcla hacia una canción que
+en la emisión ya había sonado: **corte antes de tiempo y temas repetidos**.
+
+Ahora, cuando la mezcla arranca sola por el reloj de audio, avanza también la DB.
+Dos guardas imprescindibles:
+
+- **Solo si nadie dirige** (`Date.now() - ultimoProgresoAt > 15000`). Con un panel
+  reportando posición, él pide el avance; si lo pidiesen los dos se saltaría una canción.
+- **No desde `startBroadcast`**: ahí el avance ya está en curso y se entraría en
+  recursión (`advanceQueue → startBroadcast → enterBridge → advanceQueue`). Por eso
+  `enterBridge(esperado, avanzarDb)` recibe el flag y solo `bcastTick` pasa `true`.
+
+Además `finishBridge` ya no pone `emittedMs = 0`: conserva los ms que sonaron dentro
+de la mezcla (y atrasa `clockStart` lo mismo, para no alterar el ritmo de emisión),
+si no el puente siguiente disparaba tarde.
+
+A/B con AutoDJ y **cero navegadores**, 4 canciones: desfase máximo **33,4 s → 0,0 s**.
+
 ### Precarga de la siguiente canción (CLAVE para el solapamiento)
 
 Para que el crossfade SOLAPE de verdad, la siguiente canción debe estar bufferada **antes** de empezar el fade. `preloadNext()` (en `handleTimeUpdate`, ~90s antes del final) la carga en el elemento `<audio>` inactivo:
@@ -503,6 +528,7 @@ También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-08-15 | **Sin panel conectado, la emisión y la app se separaban** — el puente movía el audio pero `nowPlaying` esperaba a la red de seguridad (`duración + 2`); el desfase se acumulaba (medido en producción: 0 → 35 → 40 → 64 s) y acababa preparando la mezcla hacia una canción ya sonada: corte antes de tiempo y repeticiones. Descubierto al ver que en una sesión de 6,5 h **96 de 97 avances los pidió el temporizador de seguridad**, no el panel. A/B con AutoDJ y cero navegadores: **33,4 s → 0,0 s**. |
 | 2026-08-15 | **Crossfade del panel arreglado de raíz** — dos fallos: (a) el bucle del fundido moría en su primer fotograma por un `IndexSizeError` al asignar un volumen > 1 (`rAF` entrega la marca del fotograma, que puede ser anterior a `t0` → `p` negativo); (b) el panel **no precargaba** la siguiente canción y la cargaba en el instante de la mezcla, 3 s antes del final. Verificado en Chromium con red estrangulada sobre transiciones reales, 4 casos (entrante normal, con 7,9 s de silencio inicial, con 1 s, y AutoDJ): **2,8 s de solape real y 0,00 s de silencio en los cuatro**. ⚠️ El primero solo se encontró **capturando `pageerror` de la página** en el test. |
 | 2026-08-11 | **Silencio inicial recortado en TODO arranque** — el recorte solo se aplicaba dentro de una transición, así que la primera canción de la sesión, un skip del DJ o una recarga del panel emitían el silencio entero. Censo: **44% de la biblioteca empieza con algo de silencio, 13% con 1 s o más**. A/B sobre "Fantasy Girl" arrancando en seco: **17 ventanas mudas de 0,5 s → 0**. |
 | 2026-08-11 | **Regla de mezcla única: solapar 3 s, sin mandos** — se quitan los dos sliders de silencio (y el de duración del crossfade, que la contradecía). El servidor calcula por canción dónde entra la siguiente según su final (seco / silencio de cola / fundido) y lo manda como `mixStartMs`; sala, `/player` y móviles usan el mismo punto. ⚠️ Dos hallazgos: `astats` imprime **por frame**, no por ventana (había que agrupar con `asetnsamples`), y **7 de cada 20 canciones empiezan con silencio** (la peor 7,9 s) — sin recortarlo el solape terminaba en −93,5 dB. Verificado sobre **60 canciones** de la biblioteca real (17 secas, 16 con cola muda, 27 con fundido): el solape cae siempre sobre música. |

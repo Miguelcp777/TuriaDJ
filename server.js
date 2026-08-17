@@ -55,6 +55,9 @@ let bcastAfterBridge= null;  // { src, skipMs } canción que retoma tras la mezc
 // eventos solo del motor, y ademas el panel ya manda los suyos.
 const SESSION_LOG_MAX = 900;
 let sessionLog       = [];
+// Ultima vez que un reproductor reporto posicion. Sirve para saber si hay
+// alguien dirigiendo la reproduccion o el motor esta solo.
+let ultimoProgresoAt = 0;
 let sessionStartTime = 0;
 
 // Devuelve cuántos bytes se pueden cortar del buffer sin partir un frame, para
@@ -113,7 +116,7 @@ function bcastTick() {
       prefetchBroadcast(esperado, nextUpDuration());   // precargar la correcta
       return;
     }
-    enterBridge(esperado);
+    enterBridge(esperado, true);
     return;
   }
 
@@ -400,7 +403,19 @@ function renderBridge(songA, startSec, songB, secs, srate, ch, yaBaja) {
 // anterior mientras `bcastSongId` dice otra cosa (ver startBroadcast).
 // `esperado` es la canción hacia la que se quiere ir; si no coincide con la que
 // lleva dentro la mezcla, esa mezcla es de otro par de canciones.
-function enterBridge(esperado) {
+//
+// `avanzarDb`: cuando la mezcla arranca sola (por el reloj de audio, sin que
+// nadie la haya pedido), hay que mover TAMBIEN `nowPlaying`. Si no, el audio se
+// va a la cancion siguiente y la base de datos se queda en la anterior hasta que
+// salta la red de seguridad en `duracion + 2`. Medido en una sesion real sin
+// ningun panel conectado, ese desfase se ACUMULA: 0 s → 35 s → 40 s → 64 s. Y
+// como "cual va despues", la precarga y la verja anti-obsoletos se calculan
+// desde la base de datos, al crecer el desfase el motor acaba preparando la
+// mezcla hacia una cancion que en la emision ya ha sonado: corte antes de
+// tiempo y temas repetidos.
+// ⚠️ NO se pasa `true` desde `startBroadcast`: ahi el avance ya esta en curso y
+// se entraria en recursion (advanceQueue → startBroadcast → enterBridge → ...).
+function enterBridge(esperado, avanzarDb = false) {
   const b = bcastBridge;
   if (!b || !b.ready || !bcastPrefetch || bcastPrefetch.songId !== b.songB) { bcastBridge = null; return false; }
   if (esperado && b.songB !== esperado) {
@@ -427,6 +442,19 @@ function enterBridge(esperado) {
     sink: { pre: Buffer.alloc(0), synced: true, out: b.buf, skipped: 0,
             srate: prev?.sink.srate, ch: prev?.sink.ch }
   };
+  // Que la app diga lo mismo que esta sonando. Fuera del tick para no meter
+  // trabajo asincrono dentro del bucle que emite audio.
+  if (avanzarDb) setImmediate(() => {
+    // Solo si NO hay nadie dirigiendo. Con un panel vivo, el avance lo pide el,
+    // y si lo pidiesemos los dos a la vez se saltaria una cancion.
+    if (Date.now() - ultimoProgresoAt < 15000) return;
+    // Y si la app ya se movio por su cuenta mientras tanto, no hay nada que hacer.
+    const actual = db.getNowPlaying();
+    if (actual && actual.id === b.songB) return;
+    slog('broadcast:dbAtrasada', { pone: String(b.songB).slice(0, 8) });
+    advanceQueue({ auto: true })
+      .catch(e => console.error('avance desde la mezcla:', e.message));
+  });
   return true;
 }
 
@@ -440,8 +468,11 @@ function finishBridge() {
   if (!src.sink.synced) src.skipPendingMs = after.skipMs;  // saltar al sincronizar
   bcastSource    = src;
   bcastSongId    = src.songId;
-  src.emittedMs  = 0;
-  src.clockStart = Date.now();
+  // La cancion ya lleva sonando `skipMs` dentro de la mezcla: si `emittedMs`
+  // volviese a cero, el puente hacia la SIGUIENTE se dispararia ese tanto mas
+  // tarde. El reloj se atrasa lo mismo para que el ritmo de emision no cambie.
+  src.emittedMs  = after.skipMs;
+  src.clockStart = Date.now() - after.skipMs;
   bcastBPS       = src.bps;
   slog('broadcast:bridgeDone', { id: String(src.songId).slice(0,8) });
   if (src.songId) analizarFinal(src, src.songId, src.durationSec || 0);
@@ -1374,6 +1405,7 @@ function resetRuntimeState() {
   advanceInFlight     = false;            // limpia mutex de avance colgado
   lastAutoAdvanceAt   = 0;                // limpia ventana de debounce de auto-avance
   lastProgress        = { position: 0 };  // posición reportada a 0
+  ultimoProgresoAt    = 0;                // nadie dirige hasta que alguien reporte
   pendingAutoDJ       = null;             // descarta peek-next memoizado de la sesión anterior
   autoDJActive        = false;
   chatMessages.length = 0;                // vacía buffer de chat (mutar array const)
@@ -1428,6 +1460,7 @@ io.on('connection', socket => {
 
   socket.on('player:progress', data => {
     lastProgress = data || { position: 0 };
+    ultimoProgresoAt = Date.now();   // hay un reproductor vivo dirigiendo
     // Reanudacion tras reiniciar el servicio a mitad de cancion. startBroadcast
     // solo se llamaba al AVANZAR de tema, asi que los oyentes de /api/live se
     // quedaban mudos hasta el siguiente cambio — con una cancion larga, minutos.
