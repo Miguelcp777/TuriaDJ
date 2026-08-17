@@ -929,6 +929,7 @@ app.post('/api/session/info', auth.adminMiddleware, (req, res) => {
 app.post('/api/session/start', auth.adminMiddleware, soloMando, (req, res) => {
   const { duration } = req.body || {};
   resetRuntimeState();   // baseline limpio: que la sesión nueva no herede estado viejo
+  db.setSetting('session_started_at', String(sessionStartTime));   // sobrevive a un reinicio
   slog('session:start', { duration: duration || 0 });
   db.setSessionActive(true);
   io.emit('session:update', { active: true, name: db.getSessionName(), desc: db.getSessionDesc() });
@@ -1785,6 +1786,11 @@ setInterval(() => { io.emit('heartbeat', Date.now()); }, 10000);
 if (db.getSessionActive()) {
   const stored = db.getSetting('session_end_time');
   if (stored) startSessionTimer(parseInt(stored));
+  // Recuperar cuando empezo la fiesta. `sessionStartTime` solo se fija al ABRIR
+  // una, asi que tras reiniciar el servicio con una fiesta ya en marcha se
+  // quedaba en 0 y el reloj de la cabecera no pintaba nada.
+  sessionStartTime = parseInt(db.getSetting('session_started_at') || '0', 10) || Date.now();
+  ultimaActividad  = Date.now();
 }
 
 const PORT = process.env.PORT || 3001;
