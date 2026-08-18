@@ -477,6 +477,45 @@ si no el puente siguiente disparaba tarde.
 
 A/B con AutoDJ y **cero navegadores**, 4 canciones: desfase máximo **33,4 s → 0,0 s**.
 
+### ⚠️ El movil en segundo plano congelaba la mezcla (corregido 2026-08-18)
+
+En el ordenador, con la pestaña a la vista, todo iba bien. Con el **panel abierto en el
+móvil y la app en segundo plano** (pantalla bloqueada, otra app encima) la canción se
+paraba antes de acabar y la siguiente no entraba **hasta volver a abrir la app**.
+
+La causa es una sola línea de política del navegador: **`requestAnimationFrame` se congela
+por completo en cuanto la pestaña deja de estar visible.** Y el bucle del fundido de
+`UnifiedView` corría sobre rAF. Dentro de ese bucle estaba *todo* el relevo: subir el
+volumen de la entrante desde 0, parar la saliente y cambiar `activeRef`. Congelado el
+bucle, la entrante se quedaba **sonando a volumen 0 para siempre**. Al volver a la app,
+rAF revive y el fundido se completa de golpe — de ahí que "abrirla lo arreglase".
+
+Los eventos del `<audio>` (`timeupdate`, `ended`) **sí** siguen llegando en segundo plano
+mientras suena algo; por eso la mezcla se disparaba y luego no hacía nada.
+
+Dos arreglos:
+
+1. **El fundido va con temporizadores, no con rAF**, y su avance se calcula con el
+   **reloj**, no contando pasos. En segundo plano el navegador espacia los timers a ~1/s:
+   contando pasos, 3 s de mezcla se estiraban a un minuto entero. Además hay un
+   `setTimeout(fadeMs + 1500)` que cierra la mezcla aunque no llegue ni un solo paso.
+   ⚠️ `PlayerView` tenía el mismo defecto de contar pasos (ya usaba `setInterval`).
+2. **Si el sistema deniega el `play()` de la entrante, no se toca la saliente.** El
+   `catch` anterior hacía `out.pause(); out.src = ''`, es decir, **dejaba la sala muda
+   antes de tiempo y sin nada sonando que pudiera recuperar**. Dejándola acabar, su propio
+   `ended` hace el relevo.
+
+Verificado con Chromium simulando el segundo plano de verdad (rAF anulado + timers a 1/s)
+sobre transiciones reales:
+
+| | antes | después |
+|---|---|---|
+| Solape real (dos temas a la vez) | **0,00 s** | **2,9 s** |
+| Cómo entra la nueva | de golpe, 0 → 1 | 0 → 0,50 → 0,87 → 1 |
+| El fundido llega a terminar | **no** | sí |
+| Con `play()` denegado: silencio | **19,25 s** | **0,25 s** |
+| Pestaña visible (no regresión) | — | solape 2,75 s, salto máx 0,13 |
+
 ### Precarga de la siguiente canción (CLAVE para el solapamiento)
 
 Para que el crossfade SOLAPE de verdad, la siguiente canción debe estar bufferada **antes** de empezar el fade. `preloadNext()` (en `handleTimeUpdate`, ~90s antes del final) la carga en el elemento `<audio>` inactivo:
@@ -582,6 +621,7 @@ También se arregló una **fuga en el reproductor voter con MSE** (`UnifiedView.
 
 | Fecha | Cambio |
 |-------|--------|
+| 2026-08-18 | **El móvil en segundo plano congelaba la mezcla** — en casa (panel en el ordenador, pestaña visible) todo iba bien; con el panel en el móvil y la app en segundo plano la canción se cortaba antes de acabar y la siguiente no entraba hasta volver a abrir la app. El bucle del fundido corría sobre `requestAnimationFrame`, **que el navegador congela por completo** al ocultar la pestaña, y dentro de ese bucle estaba todo el relevo: la entrante se quedaba sonando a volumen 0. Se pasa a temporizadores con avance medido por reloj (contar pasos estiraba 3 s a un minuto con los timers a 1/s) y cierre garantizado. Segundo fallo: si el sistema deniega el `play()` de la entrante, el `catch` paraba la saliente y borraba su `src` → **19,25 s de silencio medidos**, ahora 0,25 s. Solape real en segundo plano: **0,00 s → 2,9 s**. |
 | 2026-08-15 | **Sin panel conectado, la emisión y la app se separaban** — el puente movía el audio pero `nowPlaying` esperaba a la red de seguridad (`duración + 2`); el desfase se acumulaba (medido en producción: 0 → 35 → 40 → 64 s) y acababa preparando la mezcla hacia una canción ya sonada: corte antes de tiempo y repeticiones. Descubierto al ver que en una sesión de 6,5 h **96 de 97 avances los pidió el temporizador de seguridad**, no el panel. A/B con AutoDJ y cero navegadores: **33,4 s → 0,0 s**. |
 | 2026-08-16 | **Un solo dispositivo al mando + cierre por inactividad** — cualquier número de admins podía reproducir a la vez (dos paneles = dos avances simultáneos = canción saltada) y una fiesta podía quedarse abierta indefinidamente. Nuevo concepto de **mando** con traspaso explícito, caducidad por latido de 30 s y rechazo en servidor de las órdenes de quien no lo tiene. Cierre por inactividad (120 min por defecto) que **distingue una fiesta con el altavoz puesto de una sesión olvidada**. ⚠️ Dos hallazgos al probar: `resetRuntimeState()` borraba el mando justo al iniciar la fiesta, y el avance automático de la mezcla hay que distinguirlo del skip a mano o se rompe `RemoteView`. |
 | 2026-08-15 | **Crossfade del panel arreglado de raíz** — dos fallos: (a) el bucle del fundido moría en su primer fotograma por un `IndexSizeError` al asignar un volumen > 1 (`rAF` entrega la marca del fotograma, que puede ser anterior a `t0` → `p` negativo); (b) el panel **no precargaba** la siguiente canción y la cargaba en el instante de la mezcla, 3 s antes del final. Verificado en Chromium con red estrangulada sobre transiciones reales, 4 casos (entrante normal, con 7,9 s de silencio inicial, con 1 s, y AutoDJ): **2,8 s de solape real y 0,00 s de silencio en los cuatro**. ⚠️ El primero solo se encontró **capturando `pageerror` de la página** en el test. |

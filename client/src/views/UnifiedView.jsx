@@ -976,7 +976,7 @@ export default function UnifiedView() {
   const logout = () => {
     localStorage.removeItem('jv_auth');
     setAuthToken(null); setCurrentUser(null); setVotedSongs(new Set());
-    cancelAnimationFrame(crossfadeRaf.current);
+    pararFundido();
     [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
   };
   const isAdmin = currentUser?.role === 'admin';
@@ -1001,13 +1001,29 @@ export default function UnifiedView() {
   const voterKaRef    = useRef(null); // keepalive interval id
   const activeRef     = useRef('A');          // which element is the current player
   const fadeScheduled = useRef(false);        // crossfade has been triggered
-  const crossfadeRaf  = useRef(null);         // requestAnimationFrame handle
+  // ⚠️ El fundido se mueve con TEMPORIZADORES, no con requestAnimationFrame.
+  // Un navegador movil CONGELA rAF por completo en cuanto la pestana pasa a
+  // segundo plano (pantalla bloqueada, otra app encima), asi que el bucle del
+  // fundido no daba ni un paso: la entrante se quedaba clavada en volumen 0 y
+  // la saliente nunca se paraba. Es exactamente lo que se oia con el movil de
+  // DJ en el bolsillo — la cancion se acababa y no entraba la siguiente hasta
+  // volver a abrir la app, que es cuando rAF revive. Los temporizadores sí
+  // siguen corriendo en segundo plano (mas espaciados, pero corren).
+  const fundidoTick   = useRef(null);         // pasos del fundido
+  const fundidoFin    = useRef(null);         // red de seguridad de cierre
   // Id de la cancion ya bajada y esperando en el elemento inactivo. Sin esto el
   // panel cargaba la entrante EN EL INSTANTE de la mezcla, que son 3 s antes del
   // final: si tardaba mas, la saliente se acababa, se cortaba en seco y la
   // entrante aparecia de golpe al terminar de bajar. Es la causa del corte.
   const precargadaRef = useRef('');
   const peekEnCurso   = useRef(false);
+
+  // Declaracion (no const) a proposito: se invoca desde manejadores escritos mas
+  // arriba en el componente.
+  function pararFundido() {
+    if (fundidoTick.current) { clearInterval(fundidoTick.current); fundidoTick.current = null; }
+    if (fundidoFin.current)  { clearTimeout(fundidoFin.current);   fundidoFin.current  = null; }
+  }
 
   const getActive   = () => activeRef.current === 'A' ? audioA.current : audioB.current;
   const getInactive = () => activeRef.current === 'A' ? audioB.current : audioA.current;
@@ -1173,7 +1189,7 @@ export default function UnifiedView() {
         const active = getActive();
         const desiredSrc = '/api/stream/' + song.id;
         if (active && (!active.src || !active.src.endsWith(desiredSrc))) {
-          cancelAnimationFrame(crossfadeRaf.current);
+          pararFundido();
           fadeScheduled.current = false;
           loadAndPlay(song);
         } else if (active && active.paused) {
@@ -1196,7 +1212,7 @@ export default function UnifiedView() {
       if (desc  !== undefined) setSessionDesc(desc  || '');
       if (active === false) {
         // Sesión terminada → reset total a idle (mismo teardown que player:update null)
-        cancelAnimationFrame(crossfadeRaf.current);
+        pararFundido();
         fadeScheduled.current = false;
         [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
         activeRef.current = 'A';
@@ -1211,7 +1227,7 @@ export default function UnifiedView() {
     socket.on('player:update', (song) => {
       setNowPlaying(song);
       if (!song) {
-        cancelAnimationFrame(crossfadeRaf.current);
+        pararFundido();
         fadeScheduled.current = false;
         [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
         activeRef.current = 'A';
@@ -1228,7 +1244,7 @@ export default function UnifiedView() {
         const desiredSrc = '/api/stream/' + song.id;
         if (active && active.src && !active.src.endsWith(desiredSrc) && !fadeScheduled.current) {
           console.log('[UnifiedView] background sync: server advanced, loading new song');
-          cancelAnimationFrame(crossfadeRaf.current);
+          pararFundido();
           fadeScheduled.current = false;
           [audioA.current, audioB.current].forEach(a => { if (a && a !== active) { a.pause(); a.src = ''; a.volume = 1; } });
           loadAndPlay(song);
@@ -1460,7 +1476,7 @@ export default function UnifiedView() {
 
   // ── audio: load & play on active element ──────────────────────────────────
   const loadAndPlay = (song) => {
-    cancelAnimationFrame(crossfadeRaf.current);
+    pararFundido();
     fadeScheduled.current = false;
     precargadaRef.current = '';       // se van a limpiar los dos elementos
     [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
@@ -1637,46 +1653,60 @@ export default function UnifiedView() {
       clog('mezcla:arranca', { tema: (song.title || '').slice(0, 24),
                                precargada: yaLista, espera: Math.round(performance.now() - tPedido) });
       const t0 = performance.now();
-      cancelAnimationFrame(crossfadeRaf.current);
+      pararFundido();
       let lastLogP = -1;
-      const tick = (now) => {
-        // ⚠️ `now` es la marca de tiempo del FOTOGRAMA, y ese fotograma pudo
-        // empezar ANTES de que se leyera `t0`: sin acotar por abajo, `p` sale
-        // negativo, `1 - p` pasa de 1 y asignar ese volumen lanza IndexSizeError.
-        // La excepcion mataba el bucle en su primer paso: la saliente se quedaba
-        // a tope, la entrante a cero y al acabar la cancion se oia el corte seco
-        // con la siguiente entrando de golpe. Era la causa del fallo reportado.
-        const p = Math.max(0, Math.min((now - t0) / fadeMs, 1));
+
+      // Deja los dos elementos en un estado correcto y da la mezcla por hecha.
+      // Idempotente: lo llaman tanto el ultimo paso del fundido como la red de
+      // seguridad, y cualquiera de los dos puede llegar primero.
+      let cerrado = false;
+      const cerrar = (motivo) => {
+        if (cerrado) return;
+        cerrado = true;
+        pararFundido();
+        if (out) { out.pause(); out.src = ''; out.volume = startVol; }
+        if (inn) inn.volume = startVol;
+        activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
+        fadeScheduled.current = false;
+        precargadaRef.current = '';       // el hueco de precarga queda libre
+        const sono = +(inn.currentTime - posIni).toFixed(1);
+        clog('mezcla:hecha', { tema: (song.title || '').slice(0, 24),
+                               sono, esperado: +(fadeMs / 1000).toFixed(1),
+                               motivo, ok: sono >= fadeMs / 1000 - 0.6 });
+        console.log(`[crossfade] DONE (${motivo}) → active=${activeRef.current} (la entrante sono ${sono}s)`);
+      };
+
+      // El avance del fundido se calcula con el RELOJ, no contando pasos. Si el
+      // navegador nos espacia los ticks (en segundo plano los limita a ~1/s),
+      // el fundido sale mas escalonado pero termina igualmente en `fadeMs`
+      // reales. Contando pasos, un tick por segundo estiraria 3 s de mezcla a
+      // un minuto entero.
+      const paso = () => {
+        const p = Math.max(0, Math.min((performance.now() - t0) / fadeMs, 1));
         // Curva de POTENCIA CONSTANTE, no lineal. Con una rampa lineal, a mitad
         // del fundido los dos temas estan a 0,5 y la potencia combinada es
         // 0,5² + 0,5² = 0,5 → un hoyo de -3 dB en el centro de CADA mezcla, que
         // se oye como un bache y como que la entrante "sube de golpe" despues.
         // Con seno/coseno se cumple cos²+sen² = 1 y el volumen percibido no baja.
+        // El acotado a [0,1] tampoco sobra: asignar 1.0001 lanza IndexSizeError,
+        // y esa excepcion ya mato una vez el bucle en su primer paso.
         const vol = v => Math.max(0, Math.min(1, v));
-        const fuera = Math.cos(p * Math.PI / 2);
-        const dentro = Math.sin(p * Math.PI / 2);
-        if (out) out.volume = vol(startVol * fuera);
-        if (inn) inn.volume = vol(startVol * dentro);
-        // Log every 25% progress
+        if (out) out.volume = vol(startVol * Math.cos(p * Math.PI / 2));
+        if (inn) inn.volume = vol(startVol * Math.sin(p * Math.PI / 2));
         if (p - lastLogP >= 0.25 || p === 1) {
           lastLogP = p;
           console.log(`[crossfade] p=${p.toFixed(2)}  out=${(out?.volume ?? 0).toFixed(2)}  in=${(inn?.volume ?? 0).toFixed(2)}`);
         }
-        if (p < 1) {
-          crossfadeRaf.current = requestAnimationFrame(tick);
-        } else {
-          if (out) { out.pause(); out.src = ''; out.volume = startVol; }
-          activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
-          fadeScheduled.current = false;
-          precargadaRef.current = '';       // el hueco de precarga queda libre
-          const sono = +(inn.currentTime - posIni).toFixed(1);
-          clog('mezcla:hecha', { tema: (song.title || '').slice(0, 24),
-                                 sono, esperado: +(fadeMs / 1000).toFixed(1),
-                                 ok: sono >= fadeMs / 1000 - 0.6 });
-          console.log(`[crossfade] DONE → active=${activeRef.current} (la entrante sono ${sono}s)`);
-        }
+        if (p >= 1) cerrar('fundido');
       };
-      crossfadeRaf.current = requestAnimationFrame(tick);
+
+      fundidoTick.current = setInterval(paso, 50);
+      // Red de seguridad. Si el navegador deja de darnos pasos del todo, la
+      // mezcla se cierra igual: la saliente para y la entrante se queda al
+      // volumen bueno. Sin esto, un solo tick perdido dejaba la entrante muda
+      // para siempre.
+      fundidoFin.current = setTimeout(() => cerrar('red de seguridad'), fadeMs + 1500);
+      paso();
     };
 
     // El fundido no puede empezar hasta que la entrante pueda sonar DE VERDAD:
@@ -1689,10 +1719,14 @@ export default function UnifiedView() {
       inn.removeEventListener('canplay', siListo);
       inn.removeEventListener('seeked',  siListo);
       inn.play().then(beginFade).catch(() => {
-        // Si play falla (autoplay policy), hacer cambio brusco
-        if (out) { out.pause(); out.src = ''; out.volume = startVol; }
-        activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
-        fadeScheduled.current = false;
+        // La entrante no ha podido arrancar (politica de autoplay del sistema;
+        // pasa con el movil en segundo plano). Aqui NO se toca la saliente: la
+        // version anterior la paraba y le borraba el src, con lo que la sala se
+        // quedaba muda ANTES de tiempo y sin nada sonando que pudiera avisar de
+        // que habia que recuperar. Dejandola acabar, su propio `ended` dispara
+        // el relevo, y volver a la app tambien lo arregla.
+        clog('mezcla:sin-permiso', { tema: (song.title || '').slice(0, 24) });
+        console.warn('[crossfade] la entrante no pudo arrancar; se deja acabar la saliente');
       });
     };
     const siListo = () => { if (inn.readyState >= 3 && !inn.seeking) arrancar(); };
@@ -1813,7 +1847,7 @@ export default function UnifiedView() {
     if (fadeScheduled.current) {
       // Crossfade was triggered but animation may still be running — force complete
       clog('mezcla:cortada', { motivo: 'la saliente acabo antes de terminar el fundido' });
-      cancelAnimationFrame(crossfadeRaf.current);
+      pararFundido();
       const out = getActive(); const inn = getInactive();
       if (out) { out.pause(); out.src = ''; out.volume = 1; }
       // La entrante puede no haber arrancado todavia: si no se le da al play
@@ -1840,7 +1874,7 @@ export default function UnifiedView() {
   };
 
   const handleSkip = async () => {
-    cancelAnimationFrame(crossfadeRaf.current);
+    pararFundido();
     fadeScheduled.current = false;
     [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
     activeRef.current = 'A';
@@ -1937,7 +1971,7 @@ export default function UnifiedView() {
   };
 
   const stopAudio = () => {
-    cancelAnimationFrame(crossfadeRaf.current);
+    pararFundido();
     fadeScheduled.current = false;
     [audioA.current, audioB.current].forEach(a => { if (a) { a.pause(); a.src = ''; a.volume = 1; } });
     activeRef.current = 'A'; setIsPlaying(false);

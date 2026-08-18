@@ -61,6 +61,7 @@ export default function PlayerView() {
   const playingSrcRef  = useRef('');
   const targetVolRef   = useRef(1);
   const crossfadeTimer  = useRef(null);
+  const fadeFinTimer    = useRef(null);   // cierre garantizado del fundido
   const crossfadeMsRef  = useRef(CROSSFADE_MS); // duración del crossfade — configurable
   const preloadedRef    = useRef('');            // PV-002: ID de canción precargada en elemento inactivo
   const peekInFlight    = useRef(false);          // evita múltiples peek-next simultáneos
@@ -241,6 +242,7 @@ export default function PlayerView() {
   // ── Crossfade (A→B o B→A) ───────────────────────────────────────────────
   const stopCrossfade = () => {
     if (crossfadeTimer.current) { clearInterval(crossfadeTimer.current); crossfadeTimer.current = null; }
+    if (fadeFinTimer.current)   { clearTimeout(fadeFinTimer.current);    fadeFinTimer.current  = null; }
   };
 
   const doCrossfade = (song) => {
@@ -267,32 +269,41 @@ export default function PlayerView() {
       setIsPlaying(true);
       setNeedsTap(false);
       const vol = targetVolRef.current;
-      let step = 0;
-      const totalSteps = crossfadeMsRef.current / CROSSFADE_TICK;
-      console.log(`[crossfade] START ${crossfadeMsRef.current}ms (${totalSteps} steps) → "${song.title}"`);
+      const fadeMs = crossfadeMsRef.current;
+      const t0 = performance.now();
+      console.log(`[crossfade] START ${fadeMs}ms → "${song.title}"`);
 
-      crossfadeTimer.current = setInterval(() => {
-        step++;
-        const t = Math.min(1, step / totalSteps);
+      // Idempotente: lo llaman el ultimo paso y la red de seguridad.
+      let cerrado = false;
+      const cerrar = (motivo) => {
+        if (cerrado) return;
+        cerrado = true;
+        stopCrossfade();
+        activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
+        current.pause();
+        current.src    = '';
+        current.volume = vol;
+        next.volume    = vol;
+        advancingRef.current = false;
+        clog('crossfade:done', { song: (song.title || '').slice(0, 30), motivo });
+        console.log(`[crossfade] DONE (${motivo}) → active is now ${activeRef.current}`);
+      };
+
+      // El avance se mide con el RELOJ, no contando pasos. En segundo plano el
+      // navegador espacia los ticks a ~1/s: contando pasos, un fundido de 3 s
+      // se estiraba a un minuto entero con los dos temas sonando a la vez.
+      const paso = () => {
+        const t = Math.max(0, Math.min((performance.now() - t0) / fadeMs, 1));
         // Potencia constante (cos/sen), no rampa lineal: con la lineal, a mitad
         // del fundido ambos van a 0,5 y la potencia cae -3 dB → bache audible.
         current.volume = Math.max(0, Math.min(1, Math.cos(t * Math.PI / 2) * vol));
         next.volume    = Math.max(0, Math.min(1, Math.sin(t * Math.PI / 2) * vol));
-        // Log every ~500ms (10 ticks)
-        if (step % 10 === 0 || step === totalSteps) {
-          console.log(`[crossfade] step ${step}/${totalSteps}  out=${current.volume.toFixed(2)}  in=${next.volume.toFixed(2)}`);
-        }
-        if (step >= totalSteps) {
-          stopCrossfade();
-          activeRef.current = activeRef.current === 'A' ? 'B' : 'A';
-          current.pause();
-          current.src    = '';
-          current.volume = vol;
-          advancingRef.current = false;
-          clog('crossfade:done', { song: (song.title || '').slice(0, 30) });
-          console.log(`[crossfade] DONE → active is now ${activeRef.current}`);
-        }
-      }, CROSSFADE_TICK);
+        if (t >= 1) cerrar('fundido');
+      };
+
+      crossfadeTimer.current = setInterval(paso, CROSSFADE_TICK);
+      fadeFinTimer.current   = setTimeout(() => cerrar('red de seguridad'), fadeMs + 1500);
+      paso();
     };
 
     // `started` garantiza que next.play() se invoque UNA sola vez. Sin esto, si
